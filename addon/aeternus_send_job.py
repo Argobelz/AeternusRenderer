@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Aeternus Renderer — Send Job",
     "author": "Aeternus",
-    "version": (2, 3),
+    "version": (0, 1),
     "blender": (3, 0, 0),
     "location": "Properties > Output > Aeternus Renderer",
     "description": "Sends render jobs to the Aeternus Renderer app",
@@ -17,7 +17,7 @@ import urllib.error
 
 APP_PORT      = 47821
 APP_URL       = f"http://localhost:{APP_PORT}/add_jobs"
-ADDON_VERSION = "2.3"
+ADDON_VERSION = "0.1"
 RENDER_ROOT   = "J:\\Aeternus\\Render\\Img Seq"
 FILE_PREFIXES = ("PNT", "TXT", "VID")
 
