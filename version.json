@@ -1,5 +1,5 @@
 {
-  "version": "2.9",
+  "version": "0.1",
   "exe_url": "https://raw.githubusercontent.com/Argobelz/AeternusRenderer/main/AeternusRenderer.exe",
-  "release_notes": "v2.9 - GitHub auto-update, theme support, SQ/SH grouping, keyboard shortcuts"
+  "release_notes": "v0.1 - Initial release"
 }
