@@ -1,5 +1,5 @@
 """
-Aeternus Renderer v2.7
+Aeternus Renderer v0.1
 Standalone Windows render manager for Blender.
 """
 
@@ -23,8 +23,8 @@ from collections import defaultdict
 # ---------------------------------------------------------------------------
 
 APP_TITLE     = "Aeternus Renderer"
-APP_VERSION   = "2.9"
-ADDON_VERSION = "2.3"
+APP_VERSION   = "0.1"
+ADDON_VERSION = "0.1"
 APP_PORT      = 47821
 CONFIG_DIR    = os.path.join(os.path.expanduser("~"), ".aeternus_renderer")
 DATA_FILE     = os.path.join(CONFIG_DIR, "data.json")
@@ -118,188 +118,6 @@ T = THEMES["Dark"]   # active theme — replaced at runtime
 def apply_theme(name: str):
     global T
     T = THEMES.get(name, THEMES["Dark"])
-
-# ---------------------------------------------------------------------------
-# Updater
-# ---------------------------------------------------------------------------
-
-class Updater:
-    """
-    Checks GitHub for a newer version.json, downloads new exe if available,
-    replaces the running exe, and restarts.
-
-    version.json format:
-        { "version": "2.9", "exe_url": "https://raw.githubusercontent.com/..." }
-    """
-
-    def __init__(self, store: DataStore):
-        self._store = store
-
-    # ---- public API --------------------------------------------------------
-
-    def check_and_prompt(self, parent_widget, silent=False):
-        """
-        Call from UI thread. Spawns background check; shows dialog if update found.
-        silent=True  → only prompts when update available (used on auto-launch check).
-        silent=False → always shows result (used when user clicks Check Now).
-        """
-        def _run():
-            result = self._fetch_manifest()
-            parent_widget.after(0, lambda: self._handle_result(parent_widget, result, silent))
-        threading.Thread(target=_run, daemon=True).start()
-
-    # ---- internals ---------------------------------------------------------
-
-    def _fetch_manifest(self):
-        """Returns (latest_version, exe_url) or raises."""
-        import urllib.request
-        try:
-            with urllib.request.urlopen(UPDATE_MANIFEST_URL, timeout=8) as r:
-                data = json.loads(r.read().decode())
-            return data["version"], data.get("exe_url", UPDATE_EXE_URL)
-        except Exception as e:
-            return None, str(e)
-
-    def _handle_result(self, parent, result, silent):
-        latest, exe_url_or_err = result
-
-        if latest is None:
-            if not silent:
-                messagebox.showerror("Update Check Failed",
-                    f"Could not reach update server:\n{exe_url_or_err}",
-                    parent=parent)
-            return
-
-        if self._version_tuple(latest) <= self._version_tuple(APP_VERSION):
-            if not silent:
-                messagebox.showinfo("Up to Date",
-                    f"You're on the latest version ({APP_VERSION}).",
-                    parent=parent)
-            return
-
-        # Update available
-        if not messagebox.askyesno("Update Available",
-                f"Version {latest} is available  (you have {APP_VERSION}).\n\n"
-                f"Download and install now?",
-                parent=parent):
-            return
-
-        UpdateProgressDialog(parent, latest, exe_url_or_err)
-
-    @staticmethod
-    def _version_tuple(v):
-        try:
-            return tuple(int(x) for x in str(v).split("."))
-        except Exception:
-            return (0,)
-
-
-class UpdateProgressDialog(tk.Toplevel):
-    """Downloads the new exe, replaces the running one, and restarts."""
-
-    def __init__(self, parent, version, exe_url):
-        super().__init__(parent)
-        self.title(f"Updating to v{version}")
-        self.configure(bg=T["bg"])
-        self.resizable(False, False)
-        self.grab_set()
-        self.protocol("WM_DELETE_WINDOW", lambda: None)  # block close during download
-
-        self._version = version
-        self._exe_url = exe_url
-
-        tk.Label(self, text=f"Downloading v{version}…",
-                 bg=T["bg"], fg=T["fg"], font=("Segoe UI", 10)
-                 ).pack(padx=30, pady=(20, 8))
-
-        self._bar = ttk.Progressbar(self, length=340, mode="determinate")
-        self._bar.pack(padx=30, pady=4)
-
-        self._status = tk.Label(self, text="Connecting…",
-                                bg=T["bg"], fg=T["fg2"], font=("Segoe UI", 8))
-        self._status.pack(padx=30, pady=(4, 20))
-
-        self.update_idletasks()
-        threading.Thread(target=self._download, daemon=True).start()
-
-    def _set_status(self, text, pct=None):
-        def _do():
-            self._status.config(text=text)
-            if pct is not None:
-                self._bar["value"] = pct
-        self.after(0, _do)
-
-    def _download(self):
-        import urllib.request
-        tmp = os.path.join(CONFIG_DIR, "AeternusRenderer_update.exe")
-        try:
-            self._set_status("Downloading…", 0)
-            with urllib.request.urlopen(self._exe_url, timeout=60) as r:
-                total = int(r.headers.get("Content-Length", 0))
-                downloaded = 0
-                chunk = 65536
-                with open(tmp, "wb") as f:
-                    while True:
-                        buf = r.read(chunk)
-                        if not buf:
-                            break
-                        f.write(buf)
-                        downloaded += len(buf)
-                        if total:
-                            pct = int(downloaded / total * 100)
-                            self._set_status(
-                                f"{downloaded // 1024} / {total // 1024} KB", pct)
-            self._set_status("Installing…", 99)
-            self.after(0, lambda: self._install(tmp))
-        except Exception as e:
-            self.after(0, lambda: self._fail(str(e), tmp))
-
-    def _install(self, tmp):
-        """
-        Replace running exe with downloaded file.
-        On Windows the running exe is locked, so we use a helper .bat that:
-          1. Waits for this process to exit
-          2. Copies the new exe over the old one
-          3. Launches the new exe
-          4. Deletes itself
-        """
-        current_exe = sys.executable if getattr(sys, "frozen", False) else None
-
-        if current_exe and current_exe.endswith(".exe"):
-            bat = os.path.join(CONFIG_DIR, "update_helper.bat")
-            with open(bat, "w") as f:
-                f.write(f"""@echo off
-:wait
-tasklist /FI "PID eq {os.getpid()}" 2>NUL | find /I "AeternusRenderer" >NUL
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >NUL
-    goto wait
-)
-copy /y "{tmp}" "{current_exe}"
-start "" "{current_exe}"
-del "%~f0"
-""")
-            subprocess.Popen(["cmd", "/c", bat],
-                             creationflags=subprocess.CREATE_NO_WINDOW)
-            self.after(500, lambda: os.kill(os.getpid(), 9))
-        else:
-            # Running from source — replace main.py and restart with Python
-            target = os.path.abspath(__file__)
-            shutil.copy2(target, target + ".bak")
-            shutil.copy2(tmp, target)
-            try: os.remove(tmp)
-            except Exception: pass
-            self._set_status("Restarting…", 100)
-            self.after(800, lambda: os.execv(sys.executable,
-                                             [sys.executable] + sys.argv))
-
-    def _fail(self, err, tmp):
-        try: os.remove(tmp)
-        except Exception: pass
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        messagebox.showerror("Update Failed", f"Download error:\n{err}", parent=self)
-        self.destroy()
-
 
 # ---------------------------------------------------------------------------
 # Job model
@@ -1039,6 +857,137 @@ class SettingsDialog(tk.Toplevel):
                 "main.py replaced successfully.\nRestart now?"):
             python = sys.executable
             os.execv(python, [python] + sys.argv)
+
+# ---------------------------------------------------------------------------
+# Updater  (placed after DataStore so the type hint resolves)
+# ---------------------------------------------------------------------------
+
+class Updater:
+    def __init__(self, store: DataStore):
+        self._store = store
+
+    def check_and_prompt(self, parent_widget, silent=False):
+        def _run():
+            result = self._fetch_manifest()
+            parent_widget.after(0, lambda: self._handle_result(parent_widget, result, silent))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _fetch_manifest(self):
+        import urllib.request
+        try:
+            with urllib.request.urlopen(UPDATE_MANIFEST_URL, timeout=8) as r:
+                data = json.loads(r.read().decode())
+            return data["version"], data.get("exe_url", UPDATE_EXE_URL)
+        except Exception as e:
+            return None, str(e)
+
+    def _handle_result(self, parent, result, silent):
+        latest, exe_url_or_err = result
+        if latest is None:
+            if not silent:
+                messagebox.showerror("Update Check Failed",
+                    f"Could not reach update server:\n{exe_url_or_err}", parent=parent)
+            return
+        if self._version_tuple(latest) <= self._version_tuple(APP_VERSION):
+            if not silent:
+                messagebox.showinfo("Up to Date",
+                    f"You're on the latest version ({APP_VERSION}).", parent=parent)
+            return
+        if not messagebox.askyesno("Update Available",
+                f"Version {latest} is available  (you have {APP_VERSION}).\n\n"
+                f"Download and install now?", parent=parent):
+            return
+        UpdateProgressDialog(parent, latest, exe_url_or_err)
+
+    @staticmethod
+    def _version_tuple(v):
+        try:
+            return tuple(int(x) for x in str(v).split("."))
+        except Exception:
+            return (0,)
+
+
+class UpdateProgressDialog(tk.Toplevel):
+    def __init__(self, parent, version, exe_url):
+        super().__init__(parent)
+        self.title(f"Updating to v{version}")
+        self.configure(bg=T["bg"])
+        self.resizable(False, False)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        self._version = version
+        self._exe_url = exe_url
+
+        tk.Label(self, text=f"Downloading v{version}…",
+                 bg=T["bg"], fg=T["fg"], font=("Segoe UI", 10)
+                 ).pack(padx=30, pady=(20, 8))
+        self._bar = ttk.Progressbar(self, length=340, mode="determinate")
+        self._bar.pack(padx=30, pady=4)
+        self._status = tk.Label(self, text="Connecting…",
+                                bg=T["bg"], fg=T["fg2"], font=("Segoe UI", 8))
+        self._status.pack(padx=30, pady=(4, 20))
+        self.update_idletasks()
+        threading.Thread(target=self._download, daemon=True).start()
+
+    def _set_status(self, text, pct=None):
+        def _do():
+            self._status.config(text=text)
+            if pct is not None: self._bar["value"] = pct
+        self.after(0, _do)
+
+    def _download(self):
+        import urllib.request
+        tmp = os.path.join(CONFIG_DIR, "AeternusRenderer_update.exe")
+        try:
+            self._set_status("Downloading…", 0)
+            with urllib.request.urlopen(self._exe_url, timeout=60) as r:
+                total = int(r.headers.get("Content-Length", 0))
+                downloaded = 0
+                with open(tmp, "wb") as f:
+                    while True:
+                        buf = r.read(65536)
+                        if not buf: break
+                        f.write(buf)
+                        downloaded += len(buf)
+                        if total:
+                            self._set_status(
+                                f"{downloaded//1024} / {total//1024} KB",
+                                int(downloaded/total*100))
+            self._set_status("Installing…", 99)
+            self.after(0, lambda: self._install(tmp))
+        except Exception as e:
+            self.after(0, lambda: self._fail(str(e), tmp))
+
+    def _install(self, tmp):
+        current_exe = sys.executable if getattr(sys, "frozen", False) else None
+        if current_exe and current_exe.endswith(".exe"):
+            bat = os.path.join(CONFIG_DIR, "update_helper.bat")
+            with open(bat, "w") as f:
+                f.write(f"@echo off\n:wait\n"
+                        f"tasklist /FI \"PID eq {os.getpid()}\" 2>NUL | find /I \"AeternusRenderer\" >NUL\n"
+                        f"if not errorlevel 1 (timeout /t 1 /nobreak >NUL & goto wait)\n"
+                        f"copy /y \"{tmp}\" \"{current_exe}\"\n"
+                        f"start \"\" \"{current_exe}\"\n"
+                        f"del \"%~f0\"\n")
+            subprocess.Popen(["cmd", "/c", bat],
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+            self.after(500, lambda: os.kill(os.getpid(), 9))
+        else:
+            target = os.path.abspath(__file__)
+            shutil.copy2(target, target + ".bak")
+            shutil.copy2(tmp, target)
+            try: os.remove(tmp)
+            except Exception: pass
+            self._set_status("Restarting…", 100)
+            self.after(800, lambda: os.execv(sys.executable, [sys.executable] + sys.argv))
+
+    def _fail(self, err, tmp):
+        try: os.remove(tmp)
+        except Exception: pass
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        messagebox.showerror("Update Failed", f"Download error:\n{err}", parent=self)
+        self.destroy()
+
 
 # ---------------------------------------------------------------------------
 # Main App
