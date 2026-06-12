@@ -313,11 +313,27 @@ class JobHandler(BaseHTTPRequestHandler):
     callback = None
 
     def do_POST(self):
-        if self.path != "/add_jobs":
-            self.send_response(404); self.end_headers(); return
-        body    = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        length  = int(self.headers.get("Content-Length", 0))
+        body    = self.rfile.read(length)
         payload = json.loads(body.decode())
         addon_ver = payload.get("addon_version", "unknown")
+
+        if self.path == "/add_jobs":
+            self._handle_add(payload, addon_ver)
+        elif self.path == "/update_jobs":
+            self._handle_update(payload, addon_ver)
+        else:
+            self.send_response(404); self.end_headers()
+
+    def _send_json(self, data):
+        resp = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(resp))
+        self.end_headers()
+        self.wfile.write(resp)
+
+    def _handle_add(self, payload, addon_ver):
         if addon_ver != ADDON_VERSION:
             logger.log(f"WARNING: Addon v{addon_ver} != app expects v{ADDON_VERSION}.")
         new_jobs = []
@@ -336,12 +352,46 @@ class JobHandler(BaseHTTPRequestHandler):
         logger.log(f"Received {len(new_jobs)} job(s) from Blender (addon v{addon_ver}).")
         if JobHandler.callback:
             JobHandler.callback()
-        resp = json.dumps({"added": len(new_jobs), "app_version": APP_VERSION}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", len(resp))
-        self.end_headers()
-        self.wfile.write(resp)
+        self._send_json({"added": len(new_jobs), "app_version": APP_VERSION})
+
+    def _handle_update(self, payload, addon_ver):
+        """
+        Replace all Waiting jobs from a specific blend file with fresh data.
+        Jobs that are Rendering/Done/Failed are left untouched.
+        """
+        blend_path = payload.get("blend_path", "")
+        new_data   = payload.get("jobs", [])
+
+        if not blend_path:
+            self._send_json({"error": "blend_path required"}); return
+
+        store = JobHandler.store
+        # Remove only Waiting/Disabled jobs from this blend file
+        removable = {j.id for j in store.jobs
+                     if j.blend_path == blend_path
+                     and j.status in (STATUS_WAITING, STATUS_DISABLED, STATUS_FAILED)}
+        store.jobs = [j for j in store.jobs if j.id not in removable]
+
+        new_jobs = []
+        for rj in new_data:
+            rj["id"]               = str(uuid.uuid4())[:8]
+            rj["added_at"]         = datetime.now().isoformat()
+            rj["status"]           = STATUS_WAITING
+            rj["progress"]         = 0
+            rj["retry_count"]      = 0
+            rj["frames_rendered"]  = 0
+            rj["queue_name"]       = rj.get("episode", "Default")
+            rj["orig_frame_start"] = rj.get("frame_start", 1)
+            rj["orig_frame_end"]   = rj.get("frame_end",   1)
+            new_jobs.append(Job(rj))
+
+        store.add_jobs(new_jobs)
+        logger.log(f"Refresh: replaced {len(removable)} job(s) with {len(new_jobs)} "
+                   f"from {os.path.basename(blend_path)} (addon v{addon_ver}).")
+        if JobHandler.callback:
+            JobHandler.callback()
+        self._send_json({"replaced": len(removable), "added": len(new_jobs),
+                         "app_version": APP_VERSION})
 
     def log_message(self, *a): pass
 
@@ -1011,6 +1061,7 @@ class App(tk.Tk):
         self._auto_shutdown = tk.BooleanVar(value=self.store.auto_shutdown)
         self._auto_retry    = tk.BooleanVar(value=self.store.auto_retry)
         self._collapsed     : set[str] = set()
+        self._last_tree_refresh = 0.0
 
         self._build_ui()
         self._start_services()
@@ -1099,6 +1150,10 @@ class App(tk.Tk):
                       relief="flat", padx=12, command=cmd
                       ).pack(side="right", padx=4, pady=6)
 
+        tk.Button(tb, text="↺  Refresh", bg=T["bg3"], fg=T["fg2"],
+                  font=("Segoe UI", 8), relief="flat", padx=8,
+                  command=self._refresh).pack(side="right", padx=2, pady=6)
+
         tk.Button(tb, text="⊞ Expand All", bg=T["bg3"], fg=T["fg2"],
                   font=("Segoe UI", 8), relief="flat", padx=8,
                   command=self._expand_all).pack(side="right", padx=2, pady=6)
@@ -1166,6 +1221,7 @@ class App(tk.Tk):
         for lbl, cmd, accel in [
             ("Render Now (skip queue)",  self._ctx_render_now,        ""),
             ("Render Selected",          self._ctx_render_selected,   ""),
+            ("Refresh",                  self._refresh,               "F5"),
             ("---", None, ""),
             ("Edit Job(s)",              self._ctx_edit,              "Ctrl+E"),
             ("Set Frame…",               self._ctx_set_frame,         "Ctrl+F"),
@@ -1210,6 +1266,7 @@ class App(tk.Tk):
         self._tree.bind("<M>",                lambda e: self._ctx_toggle_disable())
         self._tree.bind("<Control-r>",        lambda e: self._ctx_rerender())
         self._tree.bind("<Control-R>",        lambda e: self._ctx_rerender())
+        self._tree.bind("<F5>",               lambda e: self._refresh())
         self._tree.bind("<space>",            lambda e: self._toggle_group_focus())
         self._tree.bind("<<TreeviewOpen>>",   lambda e: self._on_group_open())
         self._tree.bind("<<TreeviewClose>>",  lambda e: self._on_group_close())
@@ -1225,7 +1282,13 @@ class App(tk.Tk):
 
     def _tick(self):
         if self.engine.running and self.engine.current:
-            self._refresh_status(); self._refresh_jobs()
+            self._refresh_status()
+            # Only redraw the jobs tree every 5 seconds during active render
+            # to avoid Tk_GetPixmap memory pressure with large queues
+            now = time.time()
+            if now - self._last_tree_refresh >= 5:
+                self._refresh_jobs()
+                self._last_tree_refresh = now
         self.after(1000, self._tick)
 
     # ---------------------------------------------------------------- Refresh
@@ -1266,6 +1329,16 @@ class App(tk.Tk):
             return
 
         jobs = self.store.jobs_for_queue(self._active_queue)
+
+        # Normalise sequence/shot — legacy jobs may have empty fields
+        for job in jobs:
+            if not job.sequence or not job.shot:
+                # Try to parse from shot_id e.g. "EPS02_SQ03_SH002"
+                parts = job.shot_id.split("_")
+                sq = next((p for p in parts if p.startswith("SQ")), "")
+                sh = next((p for p in parts if p.startswith("SH")), "")
+                if not job.sequence: job.sequence = sq or "SQ??"
+                if not job.shot:     job.shot     = sh or job.shot_id
 
         self._tree.tag_configure("group_sq", background=T["grp_sq"][0], foreground=T["grp_sq"][1])
         self._tree.tag_configure("group_sh", background=T["grp_sh"][0], foreground=T["grp_sh"][1])
