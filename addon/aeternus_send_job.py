@@ -17,6 +17,7 @@ import urllib.error
 
 APP_PORT      = 47821
 APP_URL       = f"http://localhost:{APP_PORT}/add_jobs"
+UPDATE_URL    = f"http://localhost:{APP_PORT}/update_jobs"
 ADDON_VERSION = "0.1"
 RENDER_ROOT   = "J:\\Aeternus\\Render\\Img Seq"
 FILE_PREFIXES = ("PNT", "TXT", "VID")
@@ -262,6 +263,72 @@ class AETERNUS_OT_send_job(bpy.types.Operator):
         return {"FINISHED"}
 
 # ---------------------------------------------------------------------------
+# Operator — Update Jobs (refresh)
+# ---------------------------------------------------------------------------
+
+class AETERNUS_OT_update_jobs(bpy.types.Operator):
+    bl_idname      = "aeternus.update_jobs"
+    bl_label       = "Update Jobs (Refresh)"
+    bl_description = (
+        "Replaces all Waiting/Failed jobs from this blend file with fresh data. "
+        "Rendering or Done jobs are not touched."
+    )
+
+    def execute(self, context):
+        scene      = context.scene
+        blend_path = bpy.data.filepath
+
+        if not blend_path:
+            self.report({"ERROR"}, "Save the blend file first.")
+            return {"CANCELLED"}
+
+        prefix = get_blend_prefix(blend_path)
+        if not prefix:
+            self.report({"ERROR"},
+                f"Filename must start with PNT, TXT, or VID.")
+            return {"CANCELLED"}
+
+        phase = detect_phase(blend_path)
+
+        if prefix in ("PNT", "TXT"):
+            ranges = get_camera_ranges(scene)
+            marker_info = f"{len(ranges)} marker(s)" if ranges else "NO markers — scene range"
+            jobs, error = build_jobs_pnt_txt(scene, blend_path, phase, prefix)
+        else:
+            marker_info = "VID mode"
+            jobs, error = build_jobs_vid(scene, blend_path, phase)
+
+        if not jobs:
+            self.report({"ERROR"}, error or "No jobs could be built.")
+            return {"CANCELLED"}
+
+        if error:
+            self.report({"WARNING"}, error)
+
+        payload = json.dumps({
+            "addon_version": ADDON_VERSION,
+            "blend_path"   : blend_path,
+            "jobs"         : jobs,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            UPDATE_URL, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                result = json.loads(resp.read().decode())
+                self.report({"INFO"},
+                    f"Refreshed: replaced {result.get('replaced', 0)}, "
+                    f"added {result.get('added', 0)} job(s) — {marker_info}")
+        except urllib.error.URLError:
+            self.report({"ERROR"}, "Cannot connect to Aeternus Renderer. Is the app running?")
+            return {"CANCELLED"}
+
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
 
@@ -316,13 +383,15 @@ class AETERNUS_PT_panel(bpy.types.Panel):
                     box.label(text=f"  {vl.name}  [{scene.frame_start} – {scene.frame_end}]")
 
         layout.separator()
-        layout.operator("aeternus.send_job", icon="RENDER_ANIMATION")
+        row = layout.row(align=True)
+        row.operator("aeternus.send_job",    icon="RENDER_ANIMATION", text="Send Jobs")
+        row.operator("aeternus.update_jobs", icon="FILE_REFRESH",     text="Update Jobs")
 
 # ---------------------------------------------------------------------------
 # Register
 # ---------------------------------------------------------------------------
 
-classes = (AETERNUS_OT_send_job, AETERNUS_PT_panel)
+classes = (AETERNUS_OT_send_job, AETERNUS_OT_update_jobs, AETERNUS_PT_panel)
 
 def register():
     for cls in classes:
