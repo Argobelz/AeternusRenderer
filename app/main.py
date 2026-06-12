@@ -90,7 +90,7 @@ THEMES = {
         "grp_sq"     : ("#e8eaf6", "#3949ab"),
         "grp_sh"     : ("#eeeeee", "#666666"),
     },
-    "Claude": {
+    "Midnight": {
         "bg"         : "#1a1a2e",
         "bg2"        : "#22223a",
         "bg3"        : "#16213e",
@@ -836,7 +836,7 @@ class SettingsDialog(tk.Toplevel):
                            font=("Segoe UI", 9)
                            ).pack(side="left", padx=8)
 
-        tk.Label(self, text="Theme change takes effect after restart.",
+        tk.Label(self, text="You will be prompted to restart to fully apply.",
                  bg=T["bg"], fg=T["fg3"], font=("Segoe UI", 7)
                  ).grid(row=4, column=1, sticky="w", padx=16)
 
@@ -881,11 +881,19 @@ class SettingsDialog(tk.Toplevel):
     def _save(self):
         self._store.blender_path = self._blender.get()
         self._store.player_path  = self._player.get()
-        self._store.theme        = self._theme.get()
         self._store.auto_update  = self._auto_update.get()
+        old_theme = self._store.theme
+        new_theme = self._theme.get()
+        self._store.theme = new_theme
         self._store.save()
-        apply_theme(self._theme.get())
-        self._on_done(); self.destroy()
+        apply_theme(new_theme)
+        self._on_done()   # redraws jobs tree with new tag colours
+        self.destroy()
+        if new_theme != old_theme:
+            if messagebox.askyesno("Theme Changed",
+                    f"Theme changed to {new_theme}.\n\n"
+                    "Restart now to fully apply the new theme?"):
+                os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _check_now(self):
         Updater(self._store).check_and_prompt(self, silent=False)
@@ -1171,13 +1179,7 @@ class App(tk.Tk):
                                    selectmode="extended")
         self._tree.column("#0", width=0, minwidth=0, stretch=False)
 
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Treeview", background=T["bg"], foreground=T["fg"],
-                         fieldbackground=T["bg"], rowheight=24, font=("Segoe UI", 9))
-        style.configure("Treeview.Heading", background=T["bg2"],
-                         foreground=T["fg2"], font=("Segoe UI", 8, "bold"))
-        style.map("Treeview", background=[("selected", T["sel"])])
+        self._apply_treeview_style()
 
         for col, hdr, w, anchor in [
             ("layer",        "Layer",    80,  "center"),
@@ -1272,6 +1274,18 @@ class App(tk.Tk):
         self._tree.bind("<<TreeviewClose>>",  lambda e: self._on_group_close())
 
     # ---------------------------------------------------------------- Services
+
+    def _apply_treeview_style(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview",
+                         background=T["bg"], foreground=T["fg"],
+                         fieldbackground=T["bg"], rowheight=24,
+                         font=("Segoe UI", 9))
+        style.configure("Treeview.Heading",
+                         background=T["bg2"], foreground=T["fg2"],
+                         font=("Segoe UI", 8, "bold"))
+        style.map("Treeview", background=[("selected", T["sel"])])
 
     def _start_services(self):
         threading.Thread(target=run_http, args=(self.store, self._schedule_refresh),
