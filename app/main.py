@@ -524,7 +524,8 @@ class RenderEngine:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, creationflags=flags)
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=flags)
             done = 0
             for line in self._proc.stdout:
                 line = line.strip()
@@ -1287,7 +1288,18 @@ class App(tk.Tk):
                          font=("Segoe UI", 8, "bold"))
         style.map("Treeview", background=[("selected", T["sel"])])
 
+    def _on_close(self):
+        self.engine.stop()
+        if self.engine._proc is not None:
+            try:
+                self.engine._proc.terminate()
+                self.engine._proc.wait(timeout=5)
+            except Exception:
+                pass
+        self.destroy()
+
     def _start_services(self):
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         threading.Thread(target=run_http, args=(self.store, self._schedule_refresh),
                          daemon=True).start()
 

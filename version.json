@@ -1,6 +1,6 @@
 {
-  "version": "0.1",
+  "version": "0.2",
   "exe_url": "https://raw.githubusercontent.com/Argobelz/AeternusRenderer/main/AeternusRenderer.exe",
-  "zip_url": "https://raw.githubusercontent.com/Argobelz/AeternusRenderer/main/releases/AeternusRenderer_v0.1.zip",
-  "release_notes": "v0.1 - Initial release"
+  "zip_url": "https://raw.githubusercontent.com/Argobelz/AeternusRenderer/main/releases/AeternusRenderer_v0.2.zip",
+  "release_notes": "v0.2 - Fix charmap encoding crash on Blender output. Fix zombie Blender processes remaining after app close."
 }
