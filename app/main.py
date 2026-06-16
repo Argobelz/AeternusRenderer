@@ -14,16 +14,35 @@ import time
 import uuid
 import shutil
 import sys
+import atexit
+import signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from collections import defaultdict
+
+# ---------------------------------------------------------------------------
+# Global process registry — ensures Blender is killed if the app is
+# force-closed or crashes, leaving no orphaned processes behind.
+# ---------------------------------------------------------------------------
+_active_blender_procs: list = []
+
+def _kill_all_blender():
+    for p in _active_blender_procs:
+        try: p.kill()
+        except Exception: pass
+
+atexit.register(_kill_all_blender)
+try:
+    signal.signal(signal.SIGTERM, lambda *_: (_kill_all_blender(), sys.exit(0)))
+except Exception:
+    pass  # SIGTERM not always available on Windows
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 APP_TITLE     = "Aeternus Renderer"
-APP_VERSION   = "0.1"
+APP_VERSION   = "0.2"
 ADDON_VERSION = "0.1"
 APP_PORT      = 47821
 CONFIG_DIR    = os.path.join(os.path.expanduser("~"), ".aeternus_renderer")
@@ -433,7 +452,10 @@ class RenderEngine:
     def stop(self):
         self.running = False; self._priority_id = None
         if self._proc:
-            try: self._proc.terminate()
+            try:
+                self._proc.terminate()
+                try: self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired: self._proc.kill()
             except Exception: pass
 
     def pause(self):  self.paused = True
@@ -526,6 +548,7 @@ class RenderEngine:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=flags)
+            _active_blender_procs.append(self._proc)
             done = 0
             for line in self._proc.stdout:
                 line = line.strip()
@@ -540,6 +563,8 @@ class RenderEngine:
         except Exception as e:
             logger.log(f"Render error: {e}"); return False
         finally:
+            if self._proc in _active_blender_procs:
+                _active_blender_procs.remove(self._proc)
             self._proc = None
 
     def eta_str(self):
