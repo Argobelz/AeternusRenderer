@@ -18,7 +18,7 @@ import urllib.error
 APP_PORT      = 47821
 APP_URL       = f"http://localhost:{APP_PORT}/add_jobs"
 UPDATE_URL    = f"http://localhost:{APP_PORT}/update_jobs"
-ADDON_VERSION = "0.1"
+ADDON_VERSION = "2.3"
 RENDER_ROOT   = "J:\\Aeternus\\Render\\Img Seq"
 FILE_PREFIXES = ("PNT", "TXT", "VID")
 
@@ -40,7 +40,7 @@ def get_blend_prefix(blend_path):
     return None
 
 def parse_shot(name):
-    m = re.match(r"(EPS(\d+))_(SQ\d+)_(SH\d+)", name.strip(), re.IGNORECASE)
+    m = re.match(r"(EPS(\d+))_(SQ\d+)_(SH[0-9A-Z]+)", name.strip(), re.IGNORECASE)
     if not m:
         return None
     eps_raw = m.group(1).upper()
