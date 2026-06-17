@@ -435,12 +435,14 @@ class RenderEngine:
         self._thread      = None
         self._start_time  = None
         self._priority_id = None
+        self._user_stopped = False   # True when the user pressed Stop (not a crash)
 
     def start(self):
         if self._thread and self._thread.is_alive():
             self.paused = False; return
-        self.running = True
-        self.paused  = False
+        self.running      = True
+        self.paused       = False
+        self._user_stopped = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -450,6 +452,7 @@ class RenderEngine:
         self.store.save(); self.start()
 
     def stop(self):
+        self._user_stopped = True   # mark before killing so _loop sees it
         self.running = False; self._priority_id = None
         if self._proc:
             try:
@@ -494,6 +497,17 @@ class RenderEngine:
             self.current     = None
             self._start_time = None
 
+            # User pressed Stop — preserve progress and frame_start so that
+            # pressing Start again resumes exactly where we left off.
+            if self._user_stopped:
+                job.status = STATUS_WAITING
+                # frame_start has already been advanced by _render() to the
+                # next unrendered frame, so no extra adjustment needed.
+                logger.log(f"Stopped: {job.label}  (will resume from frame {job.frame_start})")
+                self.store.save(); self.on_update()
+                self.running = False
+                break
+
             if success:
                 out_dir = os.path.dirname(job.output_path)
                 prefix  = os.path.basename(job.output_path)
@@ -526,12 +540,17 @@ class RenderEngine:
         if not os.path.exists(blender):
             logger.log(f"Blender not found: {blender}"); return False
         os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
+
+        # Python expr only sets output path, view layer, and file format.
+        # Frame range is set via CLI flags (--frame-start / --frame-end) so
+        # Blender applies them *after* the file loads, preventing the
+        # double-render that occurred when --render-anim read stale scene values
+        # before the python-expr had a chance to update frame_start/frame_end.
         expr = (
             f"import bpy; s=bpy.context.scene; "
             f"vl=s.view_layers.get('{job.view_layer}'); "
             f"bpy.context.window.view_layer = vl if vl else s.view_layers[0]; "
             f"s.render.filepath=r'{job.output_path}'; "
-            f"s.frame_start={job.frame_start}; s.frame_end={job.frame_end}; "
             f"s.render.image_settings.file_format='TIFF'"
         )
         cmd = [blender, "--background", job.blend_path, "--python-expr", expr]
@@ -540,7 +559,14 @@ class RenderEngine:
         elif job.is_single_frame:
             cmd += ["--render-frame", str(job.frame_start)]
         else:
-            cmd += ["--render-anim"]
+            # Use CLI flags so Blender honours the correct range after file load
+            cmd += ["--frame-start", str(job.frame_start),
+                    "--frame-end",   str(job.frame_end),
+                    "--render-anim"]
+
+        # Snapshot the start frame so the progress counter stays stable even
+        # though job.frame_start advances as frames complete (for resume-on-stop).
+        render_start = job.frame_start
         total = job.total_frames
         try:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -549,18 +575,17 @@ class RenderEngine:
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=flags)
             _active_blender_procs.append(self._proc)
-            done = 0
             for line in self._proc.stdout:
                 line = line.strip()
                 if line: logger.log(line)
                 m = re.search(r"Fra:(\d+)", line)
                 if m:
-                    frame=int(m.group(1))
-                    if not hasattr(job,'_last_frame') or job._last_frame!=frame:
-                        job._last_frame=frame
-                        done=frame-job.frame_start+1
-                        job.progress=int(min(done/total*100,99))
-                        job.frame_start=max(job.frame_start,frame+1)
+                    frame = int(m.group(1))
+                    if not hasattr(job, '_last_frame') or job._last_frame != frame:
+                        job._last_frame  = frame
+                        done             = frame - render_start + 1
+                        job.progress     = int(min(done / total * 100, 99))
+                        job.frame_start  = max(job.frame_start, frame + 1)
                         self.on_update()
             self._proc.wait()
             return self._proc.returncode == 0
@@ -1193,16 +1218,11 @@ class App(tk.Tk):
 
         for txt, cmd, bg in [
             ("▶  Start", self._start, "#1a4a1a"),
-            ("⏸  Pause", self._pause, "#3a3a0a"),
             ("⏹  Stop",  self._stop,  "#4a1a1a"),
         ]:
             tk.Button(tb, text=txt, bg=bg, fg="#ddd", font=("Segoe UI", 9),
                       relief="flat", padx=12, command=cmd
                       ).pack(side="right", padx=4, pady=6)
-
-        tk.Button(tb, text="↺  Refresh", bg=T["bg3"], fg=T["fg2"],
-                  font=("Segoe UI", 8), relief="flat", padx=8,
-                  command=self._refresh).pack(side="right", padx=2, pady=6)
 
         tk.Button(tb, text="⊞ Expand All", bg=T["bg3"], fg=T["fg2"],
                   font=("Segoe UI", 8), relief="flat", padx=8,
