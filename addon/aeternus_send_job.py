@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Aeternus Renderer — Send Job",
     "author": "Aeternus",
-    "version": (0, 1),
-    "blender": (3, 0, 0),
+    "version": (0, 3),
+    "blender": (5, 0, 0),
     "location": "Properties > Output > Aeternus Renderer",
     "description": "Sends render jobs to the Aeternus Renderer app",
     "category": "Render",
