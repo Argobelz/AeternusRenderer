@@ -13,7 +13,3 @@ Custom Blender render manager for the Aeternus production pipeline.
 Open the app → Settings → **Check Now** to download and install the latest version automatically.
 
 Or enable **Check automatically on launch** to be notified on startup.
-
-## Addon version
-
-Current: `2.3` — must match the app. Both are updated together.
