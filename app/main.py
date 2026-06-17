@@ -961,16 +961,17 @@ class Updater:
         try:
             with urllib.request.urlopen(UPDATE_MANIFEST_URL, timeout=8) as r:
                 data = json.loads(r.read().decode())
-            return data["version"], data.get("exe_url", UPDATE_EXE_URL)
+            zip_url = data.get("zip_url") or data.get("exe_url", UPDATE_EXE_URL)
+            return data["version"], zip_url
         except Exception as e:
             return None, str(e)
 
     def _handle_result(self, parent, result, silent):
-        latest, exe_url_or_err = result
+        latest, zip_url_or_err = result
         if latest is None:
             if not silent:
                 messagebox.showerror("Update Check Failed",
-                    f"Could not reach update server:\n{exe_url_or_err}", parent=parent)
+                    f"Could not reach update server:\n{zip_url_or_err}", parent=parent)
             return
         if self._version_tuple(latest) <= self._version_tuple(APP_VERSION):
             if not silent:
@@ -981,7 +982,7 @@ class Updater:
                 f"Version {latest} is available  (you have {APP_VERSION}).\n\n"
                 f"Download and install now?", parent=parent):
             return
-        UpdateProgressDialog(parent, latest, exe_url_or_err)
+        UpdateProgressDialog(parent, latest, zip_url_or_err)
 
     @staticmethod
     def _version_tuple(v):
@@ -992,15 +993,16 @@ class Updater:
 
 
 class UpdateProgressDialog(tk.Toplevel):
-    def __init__(self, parent, version, exe_url):
+    def __init__(self, parent, version, zip_url):
         super().__init__(parent)
         self.title(f"Updating to v{version}")
         self.configure(bg=T["bg"])
         self.resizable(False, False)
         self.grab_set()
-        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        self._cancelled = False
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
         self._version = version
-        self._exe_url = exe_url
+        self._zip_url = zip_url
 
         tk.Label(self, text=f"Downloading v{version}…",
                  bg=T["bg"], fg=T["fg"], font=("Segoe UI", 10)
@@ -1009,26 +1011,36 @@ class UpdateProgressDialog(tk.Toplevel):
         self._bar.pack(padx=30, pady=4)
         self._status = tk.Label(self, text="Connecting…",
                                 bg=T["bg"], fg=T["fg2"], font=("Segoe UI", 8))
-        self._status.pack(padx=30, pady=(4, 20))
+        self._status.pack(padx=30, pady=(4, 8))
+        tk.Button(self, text="Cancel", bg=T["bg2"], fg=T["fg2"],
+                  relief="flat", command=self._cancel
+                  ).pack(pady=(0, 16))
         self.update_idletasks()
         threading.Thread(target=self._download, daemon=True).start()
 
+    def _cancel(self):
+        self._cancelled = True
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.destroy()
+
     def _set_status(self, text, pct=None):
         def _do():
+            if not self.winfo_exists(): return
             self._status.config(text=text)
             if pct is not None: self._bar["value"] = pct
         self.after(0, _do)
 
     def _download(self):
-        import urllib.request
-        tmp = os.path.join(CONFIG_DIR, "AeternusRenderer_update.exe")
+        import urllib.request, zipfile
+        tmp_zip = os.path.join(CONFIG_DIR, f"AeternusRenderer_v{self._version}.zip")
         try:
-            self._set_status("Downloading…", 0)
-            with urllib.request.urlopen(self._exe_url, timeout=60) as r:
+            self._set_status("Connecting…", 0)
+            with urllib.request.urlopen(self._zip_url, timeout=30) as r:
                 total = int(r.headers.get("Content-Length", 0))
                 downloaded = 0
-                with open(tmp, "wb") as f:
+                with open(tmp_zip, "wb") as f:
                     while True:
+                        if self._cancelled: return
                         buf = r.read(65536)
                         if not buf: break
                         f.write(buf)
@@ -1036,42 +1048,42 @@ class UpdateProgressDialog(tk.Toplevel):
                         if total:
                             self._set_status(
                                 f"{downloaded//1024} / {total//1024} KB",
-                                int(downloaded/total*100))
+                                int(downloaded / total * 100))
+                        else:
+                            self._set_status(f"{downloaded//1024} KB downloaded…")
+            if self._cancelled: return
             self._set_status("Installing…", 99)
-            self.after(0, lambda: self._install(tmp))
+            self.after(0, lambda: self._install(tmp_zip))
         except Exception as e:
-            self.after(0, lambda: self._fail(str(e), tmp))
+            self.after(0, lambda err=str(e): self._fail(err, tmp_zip))
 
-    def _install(self, tmp):
-        current_exe = sys.executable if getattr(sys, "frozen", False) else None
-        if current_exe and current_exe.endswith(".exe"):
-            bat = os.path.join(CONFIG_DIR, "update_helper.bat")
-            with open(bat, "w") as f:
-                f.write(f"@echo off\n:wait\n"
-                        f"tasklist /FI \"PID eq {os.getpid()}\" 2>NUL | find /I \"AeternusRenderer\" >NUL\n"
-                        f"if not errorlevel 1 (timeout /t 1 /nobreak >NUL & goto wait)\n"
-                        f"copy /y \"{tmp}\" \"{current_exe}\"\n"
-                        f"start \"\" \"{current_exe}\"\n"
-                        f"del \"%~f0\"\n")
-            subprocess.Popen(["cmd", "/c", bat],
-                             creationflags=subprocess.CREATE_NO_WINDOW)
-            self.after(500, lambda: os.kill(os.getpid(), 9))
-        else:
-            target = os.path.abspath(__file__)
-            shutil.copy2(target, target + ".bak")
-            shutil.copy2(tmp, target)
-            try: os.remove(tmp)
+    def _install(self, tmp_zip):
+        import zipfile
+        try:
+            with zipfile.ZipFile(tmp_zip, "r") as z:
+                names = z.namelist()
+                candidates = [n for n in names if n.endswith("app/main.py") or n == "main.py"]
+                if not candidates:
+                    raise FileNotFoundError(f"main.py not found in zip. Contents: {names}")
+                src_name = candidates[0]
+                target = os.path.abspath(__file__)
+                shutil.copy2(target, target + ".bak")
+                with z.open(src_name) as src, open(target, "wb") as dst:
+                    dst.write(src.read())
+            try: os.remove(tmp_zip)
             except Exception: pass
-            self._set_status("Restarting…", 100)
-            self.after(800, lambda: os.execv(sys.executable, [sys.executable] + sys.argv))
+            self._set_status("Done — restarting…", 100)
+            self.after(900, lambda: os.execv(sys.executable, [sys.executable] + sys.argv))
+        except Exception as e:
+            self._fail(str(e), tmp_zip)
 
     def _fail(self, err, tmp):
         try: os.remove(tmp)
         except Exception: pass
+        if not self.winfo_exists(): return
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         messagebox.showerror("Update Failed", f"Download error:\n{err}", parent=self)
         self.destroy()
-
 
 # ---------------------------------------------------------------------------
 # Main App

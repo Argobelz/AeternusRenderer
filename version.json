@@ -2,5 +2,5 @@
   "version": "0.2",
   "exe_url": "https://raw.githubusercontent.com/Argobelz/AeternusRenderer/main/AeternusRenderer.exe",
   "zip_url": "https://raw.githubusercontent.com/Argobelz/AeternusRenderer/main/releases/AeternusRenderer_v0.2.zip",
-  "release_notes": "v0.2 - Fixed encoding crash on Blender stdout (charmap error). Fixed orphaned Blender processes remaining after force-close."
+  "release_notes": "v0.2 - Fixed encoding crash on Blender stdout (charmap error). Fixed orphaned Blender processes on force-close. Fixed update dialog hanging and unresponsive."
 }
