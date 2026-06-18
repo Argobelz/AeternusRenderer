@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Aeternus Renderer — Send Job",
     "author": "Aeternus",
-    "version": (0, 3),
+    "version": (0, 4),
     "blender": (5, 0, 0),
     "location": "Properties > Output > Aeternus Renderer",
     "description": "Sends render jobs to the Aeternus Renderer app",
@@ -21,6 +21,34 @@ UPDATE_URL    = f"http://localhost:{APP_PORT}/update_jobs"
 ADDON_VERSION = "2.3"
 RENDER_ROOT   = "J:\\Aeternus\\Render\\Img Seq"
 FILE_PREFIXES = ("PNT", "TXT", "VID")
+
+# ---------------------------------------------------------------------------
+# Marker selection property (PNT/TXT only)
+# ---------------------------------------------------------------------------
+
+class AeternusMarkerItem(bpy.types.PropertyGroup):
+    name    : bpy.props.StringProperty()
+    enabled : bpy.props.BoolProperty(default=True)
+
+
+def _sync_marker_list(scene):
+    """Keep scene.aeternus_markers in sync with camera-bound markers."""
+    existing = {item.name for item in scene.aeternus_markers}
+    current  = {m.camera.name for m in scene.timeline_markers if m.camera}
+    # Add missing
+    for name in current - existing:
+        item = scene.aeternus_markers.add()
+        item.name = name; item.enabled = True
+    # Remove stale
+    for i in range(len(scene.aeternus_markers) - 1, -1, -1):
+        if scene.aeternus_markers[i].name not in current:
+            scene.aeternus_markers.remove(i)
+
+
+def _enabled_marker_names(scene):
+    _sync_marker_list(scene)
+    return {item.name for item in scene.aeternus_markers if item.enabled}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,13 +117,16 @@ def get_camera_ranges(scene):
 # Job builders
 # ---------------------------------------------------------------------------
 
-def build_jobs_pnt_txt(scene, blend_path, phase, prefix):
+def build_jobs_pnt_txt(scene, blend_path, phase, prefix, enabled_markers=None):
     """
     PNT / TXT: multiple cameras each bound to a timeline marker.
     One job per camera × view layer.
     Fallback to scene frame range if no markers.
+    enabled_markers: set of camera names to include (None = all).
     """
     ranges = get_camera_ranges(scene)
+    if enabled_markers is not None:
+        ranges = [r for r in ranges if r["name"] in enabled_markers]
     jobs   = []
     errors = []
 
@@ -230,8 +261,10 @@ class AETERNUS_OT_send_job(bpy.types.Operator):
 
         if prefix in ("PNT", "TXT"):
             ranges = get_camera_ranges(scene)
-            marker_info = f"{len(ranges)} marker(s)" if ranges else "NO camera-bound markers — used scene range"
-            jobs, error = build_jobs_pnt_txt(scene, blend_path, phase, prefix)
+            enabled = _enabled_marker_names(scene) if ranges else None
+            filtered = [r for r in ranges if r["name"] in enabled] if enabled else ranges
+            marker_info = f"{len(filtered)} of {len(ranges)} marker(s) selected" if ranges else "NO camera-bound markers — used scene range"
+            jobs, error = build_jobs_pnt_txt(scene, blend_path, phase, prefix, enabled)
         else:
             marker_info = "VID mode"
             jobs, error = build_jobs_vid(scene, blend_path, phase)
@@ -292,8 +325,10 @@ class AETERNUS_OT_update_jobs(bpy.types.Operator):
 
         if prefix in ("PNT", "TXT"):
             ranges = get_camera_ranges(scene)
-            marker_info = f"{len(ranges)} marker(s)" if ranges else "NO markers — scene range"
-            jobs, error = build_jobs_pnt_txt(scene, blend_path, phase, prefix)
+            enabled = _enabled_marker_names(scene) if ranges else None
+            filtered = [r for r in ranges if r["name"] in enabled] if enabled else ranges
+            marker_info = f"{len(filtered)} of {len(ranges)} marker(s) selected" if ranges else "NO markers — scene range"
+            jobs, error = build_jobs_pnt_txt(scene, blend_path, phase, prefix, enabled)
         else:
             marker_info = "VID mode"
             jobs, error = build_jobs_vid(scene, blend_path, phase)
@@ -363,17 +398,45 @@ class AETERNUS_PT_panel(bpy.types.Panel):
 
             if prefix in ("PNT", "TXT"):
                 if ranges:
+                    _sync_marker_list(scene)
+                    enabled_set = {item.name for item in scene.aeternus_markers if item.enabled}
+                    active_vl   = [v for v in scene.view_layers if v.use]
+                    selected_shots = sum(1 for r in ranges if r["name"] in enabled_set)
+                    total_jobs     = selected_shots * len(active_vl)
                     box = layout.box()
-                    box.label(text=f"Shots from markers ({len(ranges)}):", icon="CAMERA_DATA")
-                    for r in ranges:
-                        box.label(text=f"  {r['name']}  [{r['start']} – {r['end']}]")
-                    box.label(text=f"  × {len([v for v in scene.view_layers if v.use])} view layers")
-                    box.label(text=f"  = {len(ranges) * len([v for v in scene.view_layers if v.use])} total jobs")
+                    box.label(text=f"Shots from markers — {selected_shots} of {len(ranges)} selected:", icon="CAMERA_DATA")
+                    for item in scene.aeternus_markers:
+                        r_match = next((r for r in ranges if r["name"] == item.name), None)
+                        if not r_match:
+                            continue
+                        row = box.row(align=True)
+                        row.prop(item, "enabled", text="")
+                        sub = row.row()
+                        sub.enabled = item.enabled
+                        sub.label(text=f"{item.name}  [{r_match['start']} – {r_match['end']}]")
+                    box.separator()
+                    box.label(text="View layers included:")
+                    for vl in scene.view_layers:
+                        row = box.row(align=True)
+                        row.prop(vl, "use", text="")
+                        sub = row.row()
+                        sub.enabled = vl.use
+                        sub.label(text=vl.name)
+                    box.separator()
+                    box.label(text=f"Total jobs to send: {total_jobs}")
                 else:
                     box = layout.box()
                     box.label(text="No markers — using scene range:", icon="INFO")
                     box.label(text=f"  [{scene.frame_start} – {scene.frame_end}]")
-                    box.label(text=f"  × {len([v for v in scene.view_layers if v.use])} view layers")
+                    active_vl = [v for v in scene.view_layers if v.use]
+                    box.label(text=f"View layers:")
+                    for vl in scene.view_layers:
+                        row = box.row(align=True)
+                        row.prop(vl, "use", text="")
+                        sub = row.row()
+                        sub.enabled = vl.use
+                        sub.label(text=vl.name)
+                    box.label(text=f"Total jobs to send: {len(active_vl)}")
 
             elif prefix == "VID":
                 all_layers = list(scene.view_layers)
@@ -396,13 +459,15 @@ class AETERNUS_PT_panel(bpy.types.Panel):
 # Register
 # ---------------------------------------------------------------------------
 
-classes = (AETERNUS_OT_send_job, AETERNUS_OT_update_jobs, AETERNUS_PT_panel)
+classes = (AeternusMarkerItem, AETERNUS_OT_send_job, AETERNUS_OT_update_jobs, AETERNUS_PT_panel)
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    bpy.types.Scene.aeternus_markers = bpy.props.CollectionProperty(type=AeternusMarkerItem)
 
 def unregister():
+    del bpy.types.Scene.aeternus_markers
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
