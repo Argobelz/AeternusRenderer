@@ -634,7 +634,9 @@ class EditJobDialog(tk.Toplevel):
         def ent(var, row, w=50):
             e = tk.Entry(self, textvariable=var, bg=T["bg2"], fg=T["fg"],
                          insertbackground=T["fg"], font=("Segoe UI", 9), width=w)
-            e.grid(row=row, column=1, **pad); return e
+            e.grid(row=row, column=1, **pad)
+            e.bind("<Return>", lambda ev: self._apply())
+            return e
 
         j0 = jobs[0]
         self._start  = tk.StringVar(value="" if multi else str(j0.frame_start))
@@ -655,8 +657,10 @@ class EditJobDialog(tk.Toplevel):
         lbl("Output Path:", 5)
         out_frame = tk.Frame(self, bg=T["bg"])
         out_frame.grid(row=5, column=1, **pad)
-        tk.Entry(out_frame, textvariable=self._out, bg=T["bg2"], fg=T["fg"],
-                 insertbackground=T["fg"], font=("Segoe UI", 9), width=44).pack(side="left")
+        out_entry = tk.Entry(out_frame, textvariable=self._out, bg=T["bg2"], fg=T["fg"],
+                 insertbackground=T["fg"], font=("Segoe UI", 9), width=44)
+        out_entry.pack(side="left")
+        out_entry.bind("<Return>", lambda ev: self._apply())
         tk.Button(out_frame, text="…", bg=T["bg3"], fg=T["fg"],
                   relief="flat", command=self._browse).pack(side="left", padx=4)
 
