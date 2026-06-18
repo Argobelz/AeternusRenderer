@@ -42,7 +42,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 APP_TITLE     = "Aeternus Renderer"
-APP_VERSION   = "0.4"
+APP_VERSION   = "0.5"
 ADDON_VERSION = "2.3"
 APP_PORT      = 47821
 CONFIG_DIR    = os.path.join(os.path.expanduser("~"), ".aeternus_renderer")
