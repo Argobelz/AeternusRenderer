@@ -165,8 +165,10 @@ class Job:
         self.camera_name      = d.get("camera_name", "")
         self.render_time      = d.get("render_time", None)
         self.frames_rendered  = int(d.get("frames_rendered", 0))
-        self.retry_count      = int(d.get("retry_count", 0))
-        self.auto_retry       = int(d.get("auto_retry", AUTO_RETRY_MAX))
+        self.retry_count            = int(d.get("retry_count", 0))
+        self.auto_retry             = int(d.get("auto_retry", AUTO_RETRY_MAX))
+        # Cumulative frames rendered before the last Stop (persisted across sessions)
+        self.frames_rendered_at_stop = int(d.get("frames_rendered_at_stop", 0))
         raw_sf = d.get("specific_frames", None)
         self.specific_frames: list[int] | None = (
             [int(f) for f in raw_sf] if raw_sf else None
@@ -184,6 +186,16 @@ class Job:
         if self.specific_frames:
             return len(self.specific_frames)
         return max(1, self.frame_end - self.frame_start + 1)
+
+    @property
+    def orig_total_frames(self):
+        """Total frames in the original (unmodified) range."""
+        return max(1, self.orig_frame_end - self.orig_frame_start + 1)
+
+    @property
+    def cumulative_frames_rendered(self):
+        """frames_rendered_at_stop + whatever has been rendered in the current session."""
+        return self.frames_rendered_at_stop + self.frames_rendered
 
     @property
     def frames_str(self):
@@ -430,12 +442,14 @@ class RenderEngine:
         self.on_all_done  = on_all_done
         self.running      = False
         self.paused       = False
-        self.current      = None
-        self._proc        = None
-        self._thread      = None
-        self._start_time  = None
-        self._priority_id = None
-        self._user_stopped = False   # True when the user pressed Stop (not a crash)
+        self.current        = None
+        self._proc          = None
+        self._thread        = None
+        self._start_time    = None
+        self._priority_id   = None
+        self._user_stopped  = False   # True when the user pressed Stop (not a crash)
+        self._frame_durations: list[float] = []
+        self._last_frame_time: float | None = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -497,13 +511,14 @@ class RenderEngine:
             self.current     = None
             self._start_time = None
 
-            # User pressed Stop — preserve progress and frame_start so that
-            # pressing Start again resumes exactly where we left off.
+            # User pressed Stop — preserve frame_start so Start resumes exactly here.
+            # Accumulate frames_rendered into frames_rendered_at_stop so the
+            # cumulative count persists correctly across sessions.
             if self._user_stopped:
                 job.status = STATUS_WAITING
-                # frame_start has already been advanced by _render() to the
-                # next unrendered frame, so no extra adjustment needed.
-                logger.log(f"Stopped: {job.label}  (will resume from frame {job.frame_start})")
+                job.frames_rendered_at_stop += job.frames_rendered
+                job.frames_rendered          = 0
+                logger.log(f"Stopped: {job.label}  (will resume from frame {job.frame_start}  —  {job.frames_rendered_at_stop} frame(s) already done)")
                 self.store.save(); self.on_update()
                 self.running = False
                 break
@@ -519,9 +534,10 @@ class RenderEngine:
                     success = False
 
             if success:
-                job.status          = STATUS_DONE
-                job.progress        = 100
-                job.frames_rendered = job.total_frames
+                job.status                   = STATUS_DONE
+                job.progress                 = 100
+                job.frames_rendered          = job.total_frames
+                job.frames_rendered_at_stop  = 0
                 logger.log(f"Done: {job.label}  {job.total_frames} frame(s)  ({job.render_time}s)")
             else:
                 job.retry_count += 1
@@ -568,6 +584,9 @@ class RenderEngine:
         # though job.frame_start advances as frames complete (for resume-on-stop).
         render_start = job.frame_start
         total = job.total_frames
+        # Reset per-frame timing for this new render session
+        self._last_frame_time = None
+        self._frame_durations  = []
         try:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             self._proc = subprocess.Popen(
@@ -582,6 +601,13 @@ class RenderEngine:
                 if m:
                     frame = int(m.group(1))
                     if not hasattr(job, '_last_frame') or job._last_frame != frame:
+                        now = time.time()
+                        if self._last_frame_time is not None:
+                            self._frame_durations.append(now - self._last_frame_time)
+                            # Keep a rolling window of last 5 frames for ETA smoothing
+                            if len(self._frame_durations) > 5:
+                                self._frame_durations.pop(0)
+                        self._last_frame_time = now
                         job._last_frame  = frame
                         done             = frame - render_start + 1
                         job.progress     = int(min(done / total * 100, 99))
@@ -597,11 +623,40 @@ class RenderEngine:
             self._proc = None
 
     def eta_str(self):
-        if not self.current or not self._start_time: return ""
-        job = self.current; elapsed = time.time() - self._start_time
-        p = job.progress / 100.0
-        if p <= 0: return "ETA: calculating…"
-        return f"ETA: {str(timedelta(seconds=int((elapsed/p)-elapsed)))}"
+        if not self.current or not self._start_time:
+            return ""
+        job     = self.current
+        elapsed = time.time() - self._start_time
+
+        # Per-frame time: use rolling average of last completed frames
+        per_frame = None
+        if self._frame_durations:
+            per_frame = sum(self._frame_durations) / len(self._frame_durations)
+        elif elapsed > 0 and job.progress > 0:
+            done = max(1, round(job.progress / 100 * job.total_frames))
+            per_frame = elapsed / done
+
+        parts = []
+        if per_frame and per_frame > 0:
+            # Format per-frame nicely: use seconds if < 60, else m:ss
+            if per_frame < 60:
+                parts.append(f"{per_frame:.1f}s/frame")
+            else:
+                m, s = divmod(int(per_frame), 60)
+                parts.append(f"{m}m{s:02d}s/frame")
+
+            # Overall ETA: remaining frames × per-frame time
+            remaining = job.total_frames - round(job.progress / 100 * job.total_frames)
+            if remaining > 0:
+                eta_secs = int(remaining * per_frame)
+                parts.append(f"ETA {str(timedelta(seconds=eta_secs))}")
+        elif elapsed > 0 and job.progress > 0:
+            p = job.progress / 100.0
+            parts.append(f"ETA {str(timedelta(seconds=int((elapsed/p)-elapsed)))}")
+        else:
+            return "ETA: calculating…"
+
+        return "  •  ".join(parts)
 
     def queue_eta_str(self, queue_name):
         secs = self.store.queue_eta_seconds(queue_name)
@@ -1256,7 +1311,7 @@ class App(tk.Tk):
             ("output",       "Output",   340, "w"),
             ("status",       "Status",   88,  "center"),
             ("pct",          "%",        55,  "center"),
-            ("total_frames", "Frame(s)", 70,  "center"),
+            ("total_frames", "Done/Total", 90,  "center"),
         ]:
             self._tree.heading(col, text=hdr)
             self._tree.column(col, width=w, anchor=anchor, minwidth=30)
@@ -1441,7 +1496,12 @@ class App(tk.Tk):
                     else "")
             frames_display = ("~" + job.frames_str if job.range_is_modified else job.frames_str)
             out     = ("…" + job.output_path[-44:] if len(job.output_path) > 47 else job.output_path)
-            total_f = str(job.frames_rendered) if job.status == STATUS_DONE else str(job.total_frames)
+            # Show "done / total" — cumulative across stop/resume cycles
+            if job.status == STATUS_DONE:
+                total_f = f"{job.orig_total_frames} / {job.orig_total_frames}"
+            else:
+                cum = job.cumulative_frames_rendered
+                total_f = f"{cum} / {job.orig_total_frames}"
             tag     = job.status
             bg_key  = f"row_{tag.lower()}"
             self._tree.tag_configure(tag,
@@ -1513,10 +1573,11 @@ class App(tk.Tk):
                         insert_job(sh_iid, job)
 
         failed         = sum(1 for j in jobs if j.status == STATUS_FAILED)
-        total_rendered = sum(j.frames_rendered for j in jobs)
+        total_rendered = sum(j.cumulative_frames_rendered for j in jobs)
+        orig_total_all = sum(j.orig_total_frames for j in jobs)
         label          = f"  {self._active_queue}  —  {len(jobs)} job(s)"
         if failed:         label += f"  •  {failed} failed"
-        if total_rendered: label += f"  •  {total_rendered} frames rendered"
+        if total_rendered: label += f"  •  {total_rendered}/{orig_total_all} frames rendered"
         self._queue_label.config(text=label)
         self._queue_eta_label.config(text=self.engine.queue_eta_str(self._active_queue))
 
@@ -1525,9 +1586,13 @@ class App(tk.Tk):
         if e.running and not e.paused:
             cur = e.current
             if cur:
-                retry = f"  retry {cur.retry_count}/{cur.auto_retry}" if cur.retry_count else ""
+                retry  = f"  retry {cur.retry_count}/{cur.auto_retry}" if cur.retry_count else ""
+                cum    = cur.cumulative_frames_rendered
+                orig   = cur.orig_total_frames
+                frames = f"  ({cum}/{orig} frames)" if orig > 1 else ""
                 self._status_label.config(
-                    text=f"●  Rendering: {cur.label}  {cur.progress}%{retry}", fg=T["accent"])
+                    text=f"●  Rendering: {cur.label}  {cur.progress}%{frames}{retry}",
+                    fg=T["accent"])
                 self._eta_label.config(text=e.eta_str())
             else:
                 self._status_label.config(text="●  Running", fg=T["accent2"])
@@ -1599,9 +1664,10 @@ class App(tk.Tk):
         if job:
             orig  = f"  (orig: {job.orig_frame_start}–{job.orig_frame_end})" if job.range_is_modified else ""
             retry = f"  retries: {job.retry_count}/{job.auto_retry}" if job.retry_count else ""
+            cum   = f"  done: {job.cumulative_frames_rendered}/{job.orig_total_frames}" if job.cumulative_frames_rendered else ""
             self._detail.config(
                 text=f"Blend: {job.blend_path}    Layer: {job.view_layer}    "
-                     f"Frames: {job.frame_start}–{job.frame_end}{orig}    "
+                     f"Frames: {job.frame_start}–{job.frame_end}{orig}{cum}    "
                      f"Output: {job.output_path}{retry}")
 
     def _on_double_click(self, event):
