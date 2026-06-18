@@ -376,11 +376,16 @@ class AETERNUS_PT_panel(bpy.types.Panel):
                     box.label(text=f"  × {len([v for v in scene.view_layers if v.use])} view layers")
 
             elif prefix == "VID":
-                active = [v for v in scene.view_layers if v.use]
+                all_layers = list(scene.view_layers)
+                active = [v for v in all_layers if v.use]
                 box = layout.box()
-                box.label(text=f"VID layers → {len(active)} jobs:", icon="RENDERLAYERS")
-                for vl in active:
-                    box.label(text=f"  {vl.name}  [{scene.frame_start} – {scene.frame_end}]")
+                box.label(text=f"VID layers → {len(active)} job(s) selected:", icon="RENDERLAYERS")
+                for vl in all_layers:
+                    row = box.row(align=True)
+                    row.prop(vl, "use", text="")
+                    sub = row.row()
+                    sub.enabled = vl.use
+                    sub.label(text=f"{vl.name}  [{scene.frame_start} – {scene.frame_end}]")
 
         layout.separator()
         row = layout.row(align=True)

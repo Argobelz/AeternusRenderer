@@ -680,6 +680,7 @@ class EditJobDialog(tk.Toplevel):
         tk.Button(btn_frame, text="Cancel", bg=T["bg3"], fg=T["fg2"],
                   font=("Segoe UI", 9), relief="flat", padx=12,
                   command=self.destroy).pack(side="left")
+        self.bind("<Return>", lambda e: self._apply())
 
     def _browse(self):
         path = filedialog.askdirectory(title="Select Output Folder")
@@ -1289,7 +1290,6 @@ class App(tk.Tk):
             ("Refresh",                  self._refresh,               "F5"),
             ("---", None, ""),
             ("Edit Job(s)",              self._ctx_edit,              "Ctrl+E"),
-            ("Set Frame…",               self._ctx_set_frame,         "Ctrl+F"),
             ("Duplicate",                self._ctx_duplicate,         ""),
             ("Duplicate as Frame…",      self._ctx_duplicate_as_frame,""),
             ("---", None, ""),
@@ -1323,8 +1323,7 @@ class App(tk.Tk):
         self._tree.bind("<Control-A>",        lambda e: self._kb_select_all())
         self._tree.bind("<Control-e>",        lambda e: self._ctx_edit())
         self._tree.bind("<Control-E>",        lambda e: self._ctx_edit())
-        self._tree.bind("<Control-f>",        lambda e: self._ctx_set_frame())
-        self._tree.bind("<Control-F>",        lambda e: self._ctx_set_frame())
+
         self._tree.bind("<Delete>",           lambda e: self._ctx_remove())
         self._tree.bind("<Control-space>",    lambda e: self._kb_view_render())
         self._tree.bind("<m>",                lambda e: self._ctx_toggle_disable())
