@@ -1046,9 +1046,11 @@ class Updater:
         threading.Thread(target=_run, daemon=True).start()
 
     def _fetch_manifest(self):
-        import urllib.request
+        import urllib.request, time
         try:
-            with urllib.request.urlopen(UPDATE_MANIFEST_URL, timeout=8) as r:
+            # Cache-bust so GitHub CDN never serves a stale version.json
+            url = f"{UPDATE_MANIFEST_URL}?t={int(time.time())}"
+            with urllib.request.urlopen(url, timeout=8) as r:
                 data = json.loads(r.read().decode())
             zip_url = data.get("zip_url") or data.get("exe_url", UPDATE_EXE_URL)
             return data["version"], zip_url
