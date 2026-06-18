@@ -1061,6 +1061,7 @@ class UpdateProgressDialog(tk.Toplevel):
 
     def _download(self):
         import urllib.request, zipfile
+        os.makedirs(CONFIG_DIR, exist_ok=True)
         tmp_zip = os.path.join(CONFIG_DIR, f"AeternusRenderer_v{self._version}.zip")
         try:
             self._set_status("Connecting…", 0)
