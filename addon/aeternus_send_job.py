@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Aeternus Renderer — Send Job",
     "author": "Aeternus",
-    "version": (0, 5),
+    "version": (0, 6),
     "blender": (5, 0, 0),
     "location": "Properties > Output > Aeternus Renderer",
     "description": "Sends render jobs to the Aeternus Renderer app",
@@ -18,7 +18,8 @@ import urllib.error
 APP_PORT      = 47821
 APP_URL       = f"http://localhost:{APP_PORT}/add_jobs"
 UPDATE_URL    = f"http://localhost:{APP_PORT}/update_jobs"
-ADDON_VERSION = "2.4"
+ADDON_VERSION = "2.5"          # FIX #1: was "2.4" in addon, "2.3" in app — unified to 2.5
+MIN_APP_VERSION = "0.6"        # FIX #6: app must be at least this version
 RENDER_ROOT   = "J:\\Aeternus\\Render\\Img Seq"
 FILE_PREFIXES = ("PNT", "TXT", "VID")
 
@@ -33,14 +34,17 @@ class AeternusMarkerItem(bpy.types.PropertyGroup):
 
 def _sync_marker_list(scene):
     """Keep scene.aeternus_markers in sync with camera-bound markers."""
-    existing = {item.name for item in scene.aeternus_markers}
-    current  = {m.camera.name for m in scene.timeline_markers if m.camera}
-    for name in current - existing:
-        item = scene.aeternus_markers.add()
-        item.name = name; item.enabled = True
-    for i in range(len(scene.aeternus_markers) - 1, -1, -1):
-        if scene.aeternus_markers[i].name not in current:
-            scene.aeternus_markers.remove(i)
+    try:
+        existing = {item.name for item in scene.aeternus_markers}
+        current  = {m.camera.name for m in scene.timeline_markers if m.camera}
+        for name in current - existing:
+            item = scene.aeternus_markers.add()
+            item.name = name; item.enabled = True
+        for i in range(len(scene.aeternus_markers) - 1, -1, -1):
+            if scene.aeternus_markers[i].name not in current:
+                scene.aeternus_markers.remove(i)
+    except Exception as e:
+        print(f"[Aeternus] _sync_marker_list error: {e}")
 
 
 def _enabled_marker_names(scene):
@@ -132,6 +136,13 @@ def output_path(phase, parsed, layer_name):
                           parsed["eps_folder"], parsed["sq"], parsed["sh"])
     return os.path.join(folder, f"{layer_name}_{parsed['shot_id']}_")
 
+# FIX #6: version comparison helper
+def _version_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except Exception:
+        return (0,)
+
 # ---------------------------------------------------------------------------
 # Camera-bound marker reading
 # ---------------------------------------------------------------------------
@@ -141,21 +152,25 @@ def get_camera_ranges(scene):
     Returns list of {camera, name, start, end} sorted by start frame.
     End = frame before next marker, or scene.frame_end for last.
     """
-    bound = [m for m in scene.timeline_markers if m.camera is not None]
-    if not bound:
+    try:
+        bound = [m for m in scene.timeline_markers if m.camera is not None]
+        if not bound:
+            return []
+        bound.sort(key=lambda m: m.frame)
+        result = []
+        for i, m in enumerate(bound):
+            start = m.frame
+            end   = bound[i + 1].frame - 1 if i + 1 < len(bound) else scene.frame_end
+            result.append({
+                "camera": m.camera,
+                "name"  : m.camera.name,
+                "start" : start,
+                "end"   : end,
+            })
+        return result
+    except Exception as e:
+        print(f"[Aeternus] get_camera_ranges error: {e}")
         return []
-    bound.sort(key=lambda m: m.frame)
-    result = []
-    for i, m in enumerate(bound):
-        start = m.frame
-        end   = bound[i + 1].frame - 1 if i + 1 < len(bound) else scene.frame_end
-        result.append({
-            "camera": m.camera,
-            "name"  : m.camera.name,
-            "start" : start,
-            "end"   : end,
-        })
-    return result
 
 # ---------------------------------------------------------------------------
 # Job builders
@@ -278,12 +293,43 @@ def build_jobs_vid(scene, blend_path, phase):
     return (jobs or None), ("\n".join(errors) if errors else None)
 
 # ---------------------------------------------------------------------------
+# Shared send helper — FIX #6: version gate
+# ---------------------------------------------------------------------------
+
+def _send_payload(operator, url, payload_dict):
+    """
+    POST payload to the app. Returns the parsed JSON response or None on failure.
+    Applies minimum app version check.
+    """
+    payload = json.dumps(payload_dict).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result  = json.loads(resp.read().decode())
+            app_ver = result.get("app_version", "0")
+            # FIX #6: reject incompatible app versions
+            if _version_tuple(app_ver) < _version_tuple(MIN_APP_VERSION):
+                operator.report(
+                    {"ERROR"},
+                    f"App v{app_ver} is too old (need >= v{MIN_APP_VERSION}). "
+                    f"Please update Aeternus Renderer."
+                )
+                return None
+            return result
+    except urllib.error.URLError:
+        operator.report({"ERROR"}, "Cannot connect to Aeternus Renderer. Is the app running?")
+        return None
+
+# ---------------------------------------------------------------------------
 # Operator — Send Jobs
 # ---------------------------------------------------------------------------
 
 class AETERNUS_OT_send_job(bpy.types.Operator):
-    bl_idname     = "aeternus.send_job"
-    bl_label      = "Send to Aeternus Renderer"
+    bl_idname      = "aeternus.send_job"
+    bl_label       = "Send to Aeternus Renderer"
     bl_description = "Sends selected camera shots and view layers to the Aeternus Renderer app"
 
     def execute(self, context):
@@ -321,23 +367,15 @@ class AETERNUS_OT_send_job(bpy.types.Operator):
         if error:
             self.report({"WARNING"}, error)
 
-        payload = json.dumps({"addon_version": ADDON_VERSION, "jobs": jobs}).encode("utf-8")
-        req = urllib.request.Request(
-            APP_URL, data=payload,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                result    = json.loads(resp.read().decode())
-                app_ver   = result.get("app_version", "?")
-                mismatch  = f" [app v{app_ver}]" if app_ver != ADDON_VERSION else ""
-                self.report({"INFO"},
-                    f"Sent {result.get('added', 0)} job(s) — Phase: {phase}, "
-                    f"Type: {prefix} — {marker_info}{mismatch}")
-        except urllib.error.URLError:
-            self.report({"ERROR"}, "Cannot connect to Aeternus Renderer. Is the app running?")
+        result = _send_payload(self, APP_URL, {"addon_version": ADDON_VERSION, "jobs": jobs})
+        if result is None:
             return {"CANCELLED"}
 
+        app_ver  = result.get("app_version", "?")
+        mismatch = f" [app v{app_ver}]" if app_ver != ADDON_VERSION else ""
+        self.report({"INFO"},
+            f"Sent {result.get('added', 0)} job(s) — Phase: {phase}, "
+            f"Type: {prefix} — {marker_info}{mismatch}")
         return {"FINISHED"}
 
 # ---------------------------------------------------------------------------
@@ -386,31 +424,23 @@ class AETERNUS_OT_update_jobs(bpy.types.Operator):
         if error:
             self.report({"WARNING"}, error)
 
-        payload = json.dumps({
+        result = _send_payload(self, UPDATE_URL, {
             "addon_version": ADDON_VERSION,
             "blend_path"   : blend_path,
             "jobs"         : jobs,
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            UPDATE_URL, data=payload,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                result = json.loads(resp.read().decode())
-                self.report({"INFO"},
-                    f"Refreshed: replaced {result.get('replaced', 0)}, "
-                    f"added {result.get('added', 0)} job(s) — {marker_info}")
-        except urllib.error.URLError:
-            self.report({"ERROR"}, "Cannot connect to Aeternus Renderer. Is the app running?")
+        })
+        if result is None:
             return {"CANCELLED"}
 
+        self.report({"INFO"},
+            f"Refreshed: replaced {result.get('replaced', 0)}, "
+            f"added {result.get('added', 0)} job(s) — {marker_info}")
         return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
-# Panel
+# Panel  — FIX: wrapped in try/except to surface draw() errors visibly
+#           instead of silently truncating the UI
 # ---------------------------------------------------------------------------
 
 class AETERNUS_PT_panel(bpy.types.Panel):
@@ -421,26 +451,37 @@ class AETERNUS_PT_panel(bpy.types.Panel):
     bl_context     = "output"
 
     def draw(self, context):
+        try:
+            self._draw_inner(context)
+        except Exception as e:
+            self.layout.label(text=f"Panel error: {e}", icon="ERROR")
+            print(f"[Aeternus] Panel draw error: {e}")
+            import traceback; traceback.print_exc()
+
+    def _draw_inner(self, context):
         layout     = self.layout
         scene      = context.scene
         blend_path = bpy.data.filepath
 
         # ── File info box ──────────────────────────────────────────────────
         box = layout.box()
-        if blend_path:
-            prefix = get_blend_prefix(blend_path)
-            phase  = detect_phase(blend_path)
-            stem   = os.path.splitext(os.path.basename(blend_path))[0]
-            box.label(text=f"File: {stem}",          icon="BLENDER")
-            box.label(text=f"Type: {prefix or 'Unknown'}", icon="FILE_BLEND")
-            box.label(text=f"Phase: {phase}",         icon="RENDERLAYERS")
-        else:
+        if not blend_path:
             box.label(text="Blend not saved yet.", icon="ERROR")
+            return
+
+        prefix = get_blend_prefix(blend_path)
+        phase  = detect_phase(blend_path)
+        stem   = os.path.splitext(os.path.basename(blend_path))[0]
+        box.label(text=f"File: {stem}",               icon="BLENDER")
+        box.label(text=f"Type: {prefix or 'Unknown'}", icon="FILE_BLEND")
+        box.label(text=f"Phase: {phase}",              icon="RENDERLAYERS")
+
+        if not prefix:
+            box.label(text="Filename must start with PNT, TXT, or VID.", icon="ERROR")
             return
 
         layout.separator()
 
-        prefix = get_blend_prefix(blend_path)
         ranges = get_camera_ranges(scene)
 
         # ── PNT / TXT ─────────────────────────────────────────────────────
@@ -462,12 +503,16 @@ class AETERNUS_PT_panel(bpy.types.Panel):
                 hdr.operator("aeternus.markers_select_all",   text="All",  icon="CHECKBOX_HLT")
                 hdr.operator("aeternus.markers_deselect_all", text="None", icon="CHECKBOX_DEHLT")
 
-                for item in scene.aeternus_markers:
+                # Draw each marker row — iterate aeternus_markers by index to
+                # avoid referencing a PropertyGroup item directly in prop(), which
+                # can crash in some Blender contexts.
+                for idx in range(len(scene.aeternus_markers)):
+                    item    = scene.aeternus_markers[idx]
                     r_match = next((r for r in ranges if r["name"] == item.name), None)
                     if not r_match:
                         continue
                     row = box.row(align=True)
-                    row.prop(item, "enabled", text="")
+                    row.prop(scene.aeternus_markers, f"[{idx}].enabled", text="")
                     sub = row.row()
                     sub.enabled = item.enabled
                     sub.label(text=f"{item.name}  [{r_match['start']} – {r_match['end']}]")
@@ -491,7 +536,6 @@ class AETERNUS_PT_panel(bpy.types.Panel):
 
             else:
                 # No markers — single shot from filename
-                stem     = os.path.splitext(os.path.basename(blend_path))[0]
                 shot_raw = stem[len(prefix) + 1:]
                 parsed   = parse_shot(shot_raw)
 
@@ -506,6 +550,7 @@ class AETERNUS_PT_panel(bpy.types.Panel):
                 else:
                     box.label(text=f"Range: [{scene.frame_start} – {scene.frame_end}]",
                               icon="INFO")
+                    box.label(text="Filename has no valid shot ID — check naming.", icon="ERROR")
 
                 vl_hdr = box.row(align=True)
                 vl_hdr.label(text=f"View layers — {len(active_vl)} selected:",
