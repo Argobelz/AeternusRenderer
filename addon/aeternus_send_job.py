@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Aeternus Renderer — Send Job",
     "author": "Aeternus",
-    "version": (0, 4),
+    "version": (0, 5),
     "blender": (5, 0, 0),
     "location": "Properties > Output > Aeternus Renderer",
     "description": "Sends render jobs to the Aeternus Renderer app",
@@ -18,7 +18,7 @@ import urllib.error
 APP_PORT      = 47821
 APP_URL       = f"http://localhost:{APP_PORT}/add_jobs"
 UPDATE_URL    = f"http://localhost:{APP_PORT}/update_jobs"
-ADDON_VERSION = "2.3"
+ADDON_VERSION = "2.4"
 RENDER_ROOT   = "J:\\Aeternus\\Render\\Img Seq"
 FILE_PREFIXES = ("PNT", "TXT", "VID")
 
@@ -35,11 +35,9 @@ def _sync_marker_list(scene):
     """Keep scene.aeternus_markers in sync with camera-bound markers."""
     existing = {item.name for item in scene.aeternus_markers}
     current  = {m.camera.name for m in scene.timeline_markers if m.camera}
-    # Add missing
     for name in current - existing:
         item = scene.aeternus_markers.add()
         item.name = name; item.enabled = True
-    # Remove stale
     for i in range(len(scene.aeternus_markers) - 1, -1, -1):
         if scene.aeternus_markers[i].name not in current:
             scene.aeternus_markers.remove(i)
@@ -48,6 +46,52 @@ def _sync_marker_list(scene):
 def _enabled_marker_names(scene):
     _sync_marker_list(scene)
     return {item.name for item in scene.aeternus_markers if item.enabled}
+
+
+# ---------------------------------------------------------------------------
+# Select All / Deselect All operators — markers
+# ---------------------------------------------------------------------------
+
+class AETERNUS_OT_markers_select_all(bpy.types.Operator):
+    bl_idname  = "aeternus.markers_select_all"
+    bl_label   = "Select All Markers"
+    bl_options = {"REGISTER", "UNDO"}
+    def execute(self, context):
+        for item in context.scene.aeternus_markers:
+            item.enabled = True
+        return {"FINISHED"}
+
+class AETERNUS_OT_markers_deselect_all(bpy.types.Operator):
+    bl_idname  = "aeternus.markers_deselect_all"
+    bl_label   = "Deselect All Markers"
+    bl_options = {"REGISTER", "UNDO"}
+    def execute(self, context):
+        for item in context.scene.aeternus_markers:
+            item.enabled = False
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Select All / Deselect All operators — view layers
+# ---------------------------------------------------------------------------
+
+class AETERNUS_OT_layers_select_all(bpy.types.Operator):
+    bl_idname  = "aeternus.layers_select_all"
+    bl_label   = "Select All Layers"
+    bl_options = {"REGISTER", "UNDO"}
+    def execute(self, context):
+        for vl in context.scene.view_layers:
+            vl.use = True
+        return {"FINISHED"}
+
+class AETERNUS_OT_layers_deselect_all(bpy.types.Operator):
+    bl_idname  = "aeternus.layers_deselect_all"
+    bl_label   = "Deselect All Layers"
+    bl_options = {"REGISTER", "UNDO"}
+    def execute(self, context):
+        for vl in context.scene.view_layers:
+            vl.use = False
+        return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
@@ -154,10 +198,10 @@ def build_jobs_pnt_txt(scene, blend_path, phase, prefix, enabled_markers=None):
                     "camera_name" : cam_range["name"],
                 })
     else:
-        # No markers — single camera, use scene frame range
-        stem    = os.path.splitext(os.path.basename(blend_path))[0]
+        # No markers — single shot from filename, use scene frame range
+        stem     = os.path.splitext(os.path.basename(blend_path))[0]
         shot_raw = stem[len(prefix) + 1:]
-        parsed  = parse_shot(shot_raw)
+        parsed   = parse_shot(shot_raw)
         if not parsed:
             return None, f"No markers and filename '{stem}' has no valid shot ID."
         for vl in scene.view_layers:
@@ -195,7 +239,6 @@ def build_jobs_vid(scene, blend_path, phase):
         if not vl.use:
             continue
 
-        # Find camera visible in this view layer
         cam = None
         for c in cameras:
             for col in c.users_collection:
@@ -235,13 +278,13 @@ def build_jobs_vid(scene, blend_path, phase):
     return (jobs or None), ("\n".join(errors) if errors else None)
 
 # ---------------------------------------------------------------------------
-# Operator
+# Operator — Send Jobs
 # ---------------------------------------------------------------------------
 
 class AETERNUS_OT_send_job(bpy.types.Operator):
     bl_idname     = "aeternus.send_job"
     bl_label      = "Send to Aeternus Renderer"
-    bl_description = "Sends all camera shots and view layers to the Aeternus Renderer app"
+    bl_description = "Sends selected camera shots and view layers to the Aeternus Renderer app"
 
     def execute(self, context):
         scene      = context.scene
@@ -263,10 +306,12 @@ class AETERNUS_OT_send_job(bpy.types.Operator):
             ranges = get_camera_ranges(scene)
             enabled = _enabled_marker_names(scene) if ranges else None
             filtered = [r for r in ranges if r["name"] in enabled] if enabled else ranges
-            marker_info = f"{len(filtered)} of {len(ranges)} marker(s) selected" if ranges else "NO camera-bound markers — used scene range"
+            marker_info = (f"{len(filtered)} of {len(ranges)} marker(s) selected"
+                           if ranges else "NO camera-bound markers — used scene range")
             jobs, error = build_jobs_pnt_txt(scene, blend_path, phase, prefix, enabled)
         else:
-            marker_info = "VID mode"
+            active = [v for v in scene.view_layers if v.use]
+            marker_info = f"VID mode — {len(active)} layer(s) selected"
             jobs, error = build_jobs_vid(scene, blend_path, phase)
 
         if not jobs:
@@ -317,8 +362,7 @@ class AETERNUS_OT_update_jobs(bpy.types.Operator):
 
         prefix = get_blend_prefix(blend_path)
         if not prefix:
-            self.report({"ERROR"},
-                f"Filename must start with PNT, TXT, or VID.")
+            self.report({"ERROR"}, "Filename must start with PNT, TXT, or VID.")
             return {"CANCELLED"}
 
         phase = detect_phase(blend_path)
@@ -327,10 +371,12 @@ class AETERNUS_OT_update_jobs(bpy.types.Operator):
             ranges = get_camera_ranges(scene)
             enabled = _enabled_marker_names(scene) if ranges else None
             filtered = [r for r in ranges if r["name"] in enabled] if enabled else ranges
-            marker_info = f"{len(filtered)} of {len(ranges)} marker(s) selected" if ranges else "NO markers — scene range"
+            marker_info = (f"{len(filtered)} of {len(ranges)} marker(s) selected"
+                           if ranges else "NO markers — scene range")
             jobs, error = build_jobs_pnt_txt(scene, blend_path, phase, prefix, enabled)
         else:
-            marker_info = "VID mode"
+            active = [v for v in scene.view_layers if v.use]
+            marker_info = f"VID mode — {len(active)} layer(s) selected"
             jobs, error = build_jobs_vid(scene, blend_path, phase)
 
         if not jobs:
@@ -379,76 +425,121 @@ class AETERNUS_PT_panel(bpy.types.Panel):
         scene      = context.scene
         blend_path = bpy.data.filepath
 
+        # ── File info box ──────────────────────────────────────────────────
         box = layout.box()
         if blend_path:
             prefix = get_blend_prefix(blend_path)
             phase  = detect_phase(blend_path)
             stem   = os.path.splitext(os.path.basename(blend_path))[0]
-            box.label(text=f"File: {stem}", icon="BLENDER")
+            box.label(text=f"File: {stem}",          icon="BLENDER")
             box.label(text=f"Type: {prefix or 'Unknown'}", icon="FILE_BLEND")
-            box.label(text=f"Phase: {phase}", icon="RENDERLAYERS")
+            box.label(text=f"Phase: {phase}",         icon="RENDERLAYERS")
         else:
             box.label(text="Blend not saved yet.", icon="ERROR")
+            return
 
         layout.separator()
 
-        if blend_path:
-            prefix = get_blend_prefix(blend_path)
-            ranges = get_camera_ranges(scene)
+        prefix = get_blend_prefix(blend_path)
+        ranges = get_camera_ranges(scene)
 
-            if prefix in ("PNT", "TXT"):
-                if ranges:
-                    _sync_marker_list(scene)
-                    enabled_set = {item.name for item in scene.aeternus_markers if item.enabled}
-                    active_vl   = [v for v in scene.view_layers if v.use]
-                    selected_shots = sum(1 for r in ranges if r["name"] in enabled_set)
-                    total_jobs     = selected_shots * len(active_vl)
-                    box = layout.box()
-                    box.label(text=f"Shots from markers — {selected_shots} of {len(ranges)} selected:", icon="CAMERA_DATA")
-                    for item in scene.aeternus_markers:
-                        r_match = next((r for r in ranges if r["name"] == item.name), None)
-                        if not r_match:
-                            continue
-                        row = box.row(align=True)
-                        row.prop(item, "enabled", text="")
-                        sub = row.row()
-                        sub.enabled = item.enabled
-                        sub.label(text=f"{item.name}  [{r_match['start']} – {r_match['end']}]")
-                    box.separator()
-                    box.label(text="View layers included:")
-                    for vl in scene.view_layers:
-                        row = box.row(align=True)
-                        row.prop(vl, "use", text="")
-                        sub = row.row()
-                        sub.enabled = vl.use
-                        sub.label(text=vl.name)
-                    box.separator()
-                    box.label(text=f"Total jobs to send: {total_jobs}")
-                else:
-                    box = layout.box()
-                    box.label(text="No markers — using scene range:", icon="INFO")
-                    box.label(text=f"  [{scene.frame_start} – {scene.frame_end}]")
-                    active_vl = [v for v in scene.view_layers if v.use]
-                    box.label(text=f"View layers:")
-                    for vl in scene.view_layers:
-                        row = box.row(align=True)
-                        row.prop(vl, "use", text="")
-                        sub = row.row()
-                        sub.enabled = vl.use
-                        sub.label(text=vl.name)
-                    box.label(text=f"Total jobs to send: {len(active_vl)}")
+        # ── PNT / TXT ─────────────────────────────────────────────────────
+        if prefix in ("PNT", "TXT"):
+            if ranges:
+                # Marker-based: one checkbox per camera/shot
+                _sync_marker_list(scene)
+                enabled_set    = {item.name for item in scene.aeternus_markers if item.enabled}
+                active_vl      = [v for v in scene.view_layers if v.use]
+                selected_shots = sum(1 for r in ranges if r["name"] in enabled_set)
+                total_jobs     = selected_shots * len(active_vl)
 
-            elif prefix == "VID":
-                all_layers = list(scene.view_layers)
-                active = [v for v in all_layers if v.use]
                 box = layout.box()
-                box.label(text=f"VID layers → {len(active)} job(s) selected:", icon="RENDERLAYERS")
-                for vl in all_layers:
+                # Header row with Select All / Deselect All
+                hdr = box.row(align=True)
+                hdr.label(
+                    text=f"Shots — {selected_shots} of {len(ranges)} selected:",
+                    icon="CAMERA_DATA")
+                hdr.operator("aeternus.markers_select_all",   text="All",  icon="CHECKBOX_HLT")
+                hdr.operator("aeternus.markers_deselect_all", text="None", icon="CHECKBOX_DEHLT")
+
+                for item in scene.aeternus_markers:
+                    r_match = next((r for r in ranges if r["name"] == item.name), None)
+                    if not r_match:
+                        continue
+                    row = box.row(align=True)
+                    row.prop(item, "enabled", text="")
+                    sub = row.row()
+                    sub.enabled = item.enabled
+                    sub.label(text=f"{item.name}  [{r_match['start']} – {r_match['end']}]")
+
+                box.separator()
+
+                # View layers sub-section
+                vl_hdr = box.row(align=True)
+                vl_hdr.label(text="View layers:", icon="RENDERLAYERS")
+                vl_hdr.operator("aeternus.layers_select_all",   text="All",  icon="CHECKBOX_HLT")
+                vl_hdr.operator("aeternus.layers_deselect_all", text="None", icon="CHECKBOX_DEHLT")
+                for vl in scene.view_layers:
                     row = box.row(align=True)
                     row.prop(vl, "use", text="")
                     sub = row.row()
                     sub.enabled = vl.use
-                    sub.label(text=f"{vl.name}  [{scene.frame_start} – {scene.frame_end}]")
+                    sub.label(text=vl.name)
+
+                box.separator()
+                box.label(text=f"Total jobs to send: {total_jobs}")
+
+            else:
+                # No markers — single shot from filename
+                stem     = os.path.splitext(os.path.basename(blend_path))[0]
+                shot_raw = stem[len(prefix) + 1:]
+                parsed   = parse_shot(shot_raw)
+
+                active_vl  = [v for v in scene.view_layers if v.use]
+                total_jobs = len(active_vl)
+
+                box = layout.box()
+                if parsed:
+                    box.label(
+                        text=f"Shot: {parsed['shot_id']}  [{scene.frame_start} – {scene.frame_end}]",
+                        icon="CAMERA_DATA")
+                else:
+                    box.label(text=f"Range: [{scene.frame_start} – {scene.frame_end}]",
+                              icon="INFO")
+
+                vl_hdr = box.row(align=True)
+                vl_hdr.label(text=f"View layers — {len(active_vl)} selected:",
+                             icon="RENDERLAYERS")
+                vl_hdr.operator("aeternus.layers_select_all",   text="All",  icon="CHECKBOX_HLT")
+                vl_hdr.operator("aeternus.layers_deselect_all", text="None", icon="CHECKBOX_DEHLT")
+                for vl in scene.view_layers:
+                    row = box.row(align=True)
+                    row.prop(vl, "use", text="")
+                    sub = row.row()
+                    sub.enabled = vl.use
+                    sub.label(text=vl.name)
+
+                box.separator()
+                box.label(text=f"Total jobs to send: {total_jobs}")
+
+        # ── VID ───────────────────────────────────────────────────────────
+        elif prefix == "VID":
+            all_layers = list(scene.view_layers)
+            active     = [v for v in all_layers if v.use]
+
+            box = layout.box()
+            hdr = box.row(align=True)
+            hdr.label(text=f"VID layers — {len(active)} of {len(all_layers)} selected:",
+                      icon="RENDERLAYERS")
+            hdr.operator("aeternus.layers_select_all",   text="All",  icon="CHECKBOX_HLT")
+            hdr.operator("aeternus.layers_deselect_all", text="None", icon="CHECKBOX_DEHLT")
+
+            for vl in all_layers:
+                row = box.row(align=True)
+                row.prop(vl, "use", text="")
+                sub = row.row()
+                sub.enabled = vl.use
+                sub.label(text=f"{vl.name}  [{scene.frame_start} – {scene.frame_end}]")
 
         layout.separator()
         row = layout.row(align=True)
@@ -459,7 +550,16 @@ class AETERNUS_PT_panel(bpy.types.Panel):
 # Register
 # ---------------------------------------------------------------------------
 
-classes = (AeternusMarkerItem, AETERNUS_OT_send_job, AETERNUS_OT_update_jobs, AETERNUS_PT_panel)
+classes = (
+    AeternusMarkerItem,
+    AETERNUS_OT_markers_select_all,
+    AETERNUS_OT_markers_deselect_all,
+    AETERNUS_OT_layers_select_all,
+    AETERNUS_OT_layers_deselect_all,
+    AETERNUS_OT_send_job,
+    AETERNUS_OT_update_jobs,
+    AETERNUS_PT_panel,
+)
 
 def register():
     for cls in classes:
