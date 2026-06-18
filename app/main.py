@@ -1,5 +1,5 @@
 """
-Aeternus Renderer v0.4
+Aeternus Renderer v0.7
 Standalone Windows render manager for Blender.
 """
 
@@ -42,8 +42,8 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 APP_TITLE     = "Aeternus Renderer"
-APP_VERSION   = "0.6"
-ADDON_VERSION = "2.3"
+APP_VERSION   = "0.7"
+ADDON_VERSION = "2.5"          # FIX #1: unified with addon — was mismatched (app 2.3, addon 2.4)
 APP_PORT      = 47821
 CONFIG_DIR    = os.path.join(os.path.expanduser("~"), ".aeternus_renderer")
 DATA_FILE     = os.path.join(CONFIG_DIR, "data.json")
@@ -364,9 +364,25 @@ class JobHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(resp)
 
-    def _handle_add(self, payload, addon_ver):
+    def _check_addon_version(self, addon_ver):
+        """FIX #6: reject addon versions that are incompatible."""
+        def _vtuple(v):
+            try: return tuple(int(x) for x in str(v).split("."))
+            except: return (0,)
+        # Require at least addon 2.5
+        MIN_ADDON = "2.5"
+        if _vtuple(addon_ver) < _vtuple(MIN_ADDON):
+            logger.log(f"REJECTED: Addon v{addon_ver} is too old (need >= v{MIN_ADDON}). Update the Blender addon.")
+            return False
         if addon_ver != ADDON_VERSION:
-            logger.log(f"WARNING: Addon v{addon_ver} != app expects v{ADDON_VERSION}.")
+            logger.log(f"WARNING: Addon v{addon_ver} != app v{ADDON_VERSION} — continuing anyway.")
+        return True
+
+    def _handle_add(self, payload, addon_ver):
+        if not self._check_addon_version(addon_ver):
+            self._send_json({"error": f"Addon too old. Need >= 2.5, got {addon_ver}.",
+                             "app_version": APP_VERSION})
+            return
         new_jobs = []
         for rj in payload.get("jobs", []):
             rj["id"]              = str(uuid.uuid4())[:8]
@@ -390,6 +406,10 @@ class JobHandler(BaseHTTPRequestHandler):
         Replace all Waiting jobs from a specific blend file with fresh data.
         Jobs that are Rendering/Done/Failed are left untouched.
         """
+        if not self._check_addon_version(addon_ver):
+            self._send_json({"error": f"Addon too old. Need >= 2.5, got {addon_ver}.",
+                             "app_version": APP_VERSION})
+            return
         blend_path = payload.get("blend_path", "")
         new_data   = payload.get("jobs", [])
 
@@ -397,7 +417,6 @@ class JobHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "blend_path required"}); return
 
         store = JobHandler.store
-        # Remove only Waiting/Disabled jobs from this blend file
         removable = {j.id for j in store.jobs
                      if j.blend_path == blend_path
                      and j.status in (STATUS_WAITING, STATUS_DISABLED, STATUS_FAILED)}
@@ -447,7 +466,7 @@ class RenderEngine:
         self._thread        = None
         self._start_time    = None
         self._priority_id   = None
-        self._user_stopped  = False   # True when the user pressed Stop (not a crash)
+        self._user_stopped  = False
         self._frame_durations: list[float] = []
         self._last_frame_time: float | None = None
 
@@ -466,7 +485,7 @@ class RenderEngine:
         self.store.save(); self.start()
 
     def stop(self):
-        self._user_stopped = True   # mark before killing so _loop sees it
+        self._user_stopped = True
         self.running = False; self._priority_id = None
         if self._proc:
             try:
@@ -500,7 +519,7 @@ class RenderEngine:
 
             self.current     = job
             job.status       = STATUS_RENDERING
-            job.progress = max(job.progress,0)
+            job.progress = max(job.progress, 0)
             self._start_time = time.time()
             self.store.save(); self.on_update()
             logger.log(f"Started: {job.label}  {job.frames_str}")
@@ -511,9 +530,6 @@ class RenderEngine:
             self.current     = None
             self._start_time = None
 
-            # User pressed Stop — preserve frame_start so Start resumes exactly here.
-            # Accumulate frames_rendered into frames_rendered_at_stop so the
-            # cumulative count persists correctly across sessions.
             if self._user_stopped:
                 job.status = STATUS_WAITING
                 job.frames_rendered_at_stop += job.frames_rendered
@@ -524,13 +540,19 @@ class RenderEngine:
                 break
 
             if success:
+                # FIX #3: guard listdir so a missing/uncreated folder doesn't
+                # silently mark the job failed with a misleading "no output" log.
                 out_dir = os.path.dirname(job.output_path)
                 prefix  = os.path.basename(job.output_path)
-                written = any(
-                    f.startswith(prefix) for f in os.listdir(out_dir)
-                ) if os.path.isdir(out_dir) else False
+                try:
+                    written = os.path.isdir(out_dir) and any(
+                        f.startswith(prefix) for f in os.listdir(out_dir)
+                    )
+                except Exception as e:
+                    logger.log(f"WARNING: {job.label} — output check failed ({e}). Trusting Blender exit code.")
+                    written = True   # trust the zero exit code; don't double-fail
                 if not written:
-                    logger.log(f"WARNING: {job.label} — no output files found. Marking Failed.")
+                    logger.log(f"WARNING: {job.label} — no output files found in {out_dir}. Marking Failed.")
                     success = False
 
             if success:
@@ -557,11 +579,6 @@ class RenderEngine:
             logger.log(f"Blender not found: {blender}"); return False
         os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
 
-        # Python expr only sets output path, view layer, and file format.
-        # Frame range is set via CLI flags (--frame-start / --frame-end) so
-        # Blender applies them *after* the file loads, preventing the
-        # double-render that occurred when --render-anim read stale scene values
-        # before the python-expr had a chance to update frame_start/frame_end.
         expr = (
             f"import bpy; s=bpy.context.scene; "
             f"vl=s.view_layers.get('{job.view_layer}'); "
@@ -575,18 +592,25 @@ class RenderEngine:
         elif job.is_single_frame:
             cmd += ["--render-frame", str(job.frame_start)]
         else:
-            # Use CLI flags so Blender honours the correct range after file load
             cmd += ["--frame-start", str(job.frame_start),
                     "--frame-end",   str(job.frame_end),
                     "--render-anim"]
 
-        # Snapshot the start frame so the progress counter stays stable even
-        # though job.frame_start advances as frames complete (for resume-on-stop).
         render_start = job.frame_start
         total = job.total_frames
-        # Reset per-frame timing for this new render session
+
+        # FIX #2: for specific_frames, build an index so progress counts
+        # completed items (1, 2, 3…) not arithmetic on frame numbers.
+        if job.specific_frames:
+            specific_set   = set(job.specific_frames)
+            frames_done_set: set[int] = set()
+        else:
+            specific_set   = None
+            frames_done_set = None
+
         self._last_frame_time = None
         self._frame_durations  = []
+
         try:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             self._proc = subprocess.Popen(
@@ -604,14 +628,22 @@ class RenderEngine:
                         now = time.time()
                         if self._last_frame_time is not None:
                             self._frame_durations.append(now - self._last_frame_time)
-                            # Keep a rolling window of last 5 frames for ETA smoothing
                             if len(self._frame_durations) > 5:
                                 self._frame_durations.pop(0)
                         self._last_frame_time = now
-                        job._last_frame  = frame
-                        done             = frame - render_start + 1
-                        job.progress     = int(min(done / total * 100, 99))
-                        job.frame_start  = max(job.frame_start, frame + 1)
+                        job._last_frame = frame
+
+                        # FIX #2: progress for specific_frames uses set membership
+                        # not arithmetic — correctly handles non-contiguous frame lists.
+                        if specific_set is not None:
+                            if frame in specific_set:
+                                frames_done_set.add(frame)
+                            done = len(frames_done_set)
+                        else:
+                            done         = frame - render_start + 1
+                            job.frame_start = max(job.frame_start, frame + 1)
+
+                        job.progress = int(min(done / total * 100, 99))
                         self.on_update()
             self._proc.wait()
             return self._proc.returncode == 0
@@ -628,7 +660,6 @@ class RenderEngine:
         job     = self.current
         elapsed = time.time() - self._start_time
 
-        # Per-frame time: use rolling average of last completed frames
         per_frame = None
         if self._frame_durations:
             per_frame = sum(self._frame_durations) / len(self._frame_durations)
@@ -638,19 +669,18 @@ class RenderEngine:
 
         parts = []
         if per_frame and per_frame > 0:
-            # Format per-frame nicely: use seconds if < 60, else m:ss
             if per_frame < 60:
                 parts.append(f"{per_frame:.1f}s/frame")
             else:
                 m, s = divmod(int(per_frame), 60)
                 parts.append(f"{m}m{s:02d}s/frame")
 
-            # Overall ETA: remaining frames × per-frame time
             remaining = job.total_frames - round(job.progress / 100 * job.total_frames)
             if remaining > 0:
                 eta_secs = int(remaining * per_frame)
                 parts.append(f"ETA {str(timedelta(seconds=eta_secs))}")
         elif elapsed > 0 and job.progress > 0:
+            # FIX #4: guard against p=0 divide — only runs this branch when progress > 0
             p = job.progress / 100.0
             parts.append(f"ETA {str(timedelta(seconds=int((elapsed/p)-elapsed)))}")
         else:
@@ -661,14 +691,16 @@ class RenderEngine:
     def queue_eta_str(self, queue_name):
         secs = self.store.queue_eta_seconds(queue_name)
         if secs is None: return ""
+        # FIX #4: guard p=0 in queue ETA
         if self.current and self._start_time and self.current.queue_name == queue_name:
             elapsed = time.time() - self._start_time
             p = self.current.progress / 100.0
-            if p > 0: secs += max(0, (elapsed/p) - elapsed)
+            if p > 0:
+                secs += max(0, (elapsed/p) - elapsed)
         return f"Queue ETA: {str(timedelta(seconds=int(secs)))}"
 
 # ---------------------------------------------------------------------------
-# Edit Job dialog  (frame start/end + specific frames + view layer + output)
+# Edit Job dialog
 # ---------------------------------------------------------------------------
 
 class EditJobDialog(tk.Toplevel):
@@ -724,15 +756,23 @@ class EditJobDialog(tk.Toplevel):
                      bg=T["bg"], fg=T["fg3"], font=("Segoe UI", 8)
                      ).grid(row=6, column=0, columnspan=2, pady=(0,4))
 
-        # Restore original range button
         if any(j.range_is_modified for j in jobs):
             tk.Button(self, text="↩  Restore Original Range",
                       bg=T["bg2"], fg=T["accent"],
                       font=("Segoe UI", 9), relief="flat", padx=12,
                       command=self._restore).grid(row=7, column=0, columnspan=2, pady=(4,0))
 
+        # FIX #7: Resume from last good frame button
+        resumable = [j for j in jobs if j.frames_rendered_at_stop > 0 and
+                     j.status != STATUS_DONE and j.status != STATUS_RENDERING]
+        if resumable:
+            tk.Button(self, text="⏩  Resume from Last Good Frame",
+                      bg=T["bg2"], fg=T["accent2"],
+                      font=("Segoe UI", 9), relief="flat", padx=12,
+                      command=self._resume_from_last).grid(row=9, column=0, columnspan=2, pady=(4,0))
+
         btn_frame = tk.Frame(self, bg=T["bg"])
-        btn_frame.grid(row=8, column=0, columnspan=2, pady=12)
+        btn_frame.grid(row=10, column=0, columnspan=2, pady=12)
         tk.Button(btn_frame, text="Apply", bg="#2a4a6e", fg="#ddd",
                   font=("Segoe UI", 9), relief="flat", padx=20,
                   command=self._apply).pack(side="left", padx=8)
@@ -759,7 +799,7 @@ class EditJobDialog(tk.Toplevel):
             if sf is not None:
                 job.specific_frames = sf
             elif sf_text == "":
-                pass  # blank = keep existing
+                pass
             else:
                 job.specific_frames = None
             if self._start.get():
@@ -785,8 +825,19 @@ class EditJobDialog(tk.Toplevel):
                 job.status = STATUS_WAITING; job.progress = 0
         self._store.save(); self._on_done(); self.destroy()
 
+    def _resume_from_last(self):
+        """FIX #7: set frame_start to the first unrendered frame based on accumulated progress."""
+        for job in self._jobs:
+            if job.frames_rendered_at_stop > 0 and job.status not in (STATUS_RENDERING, STATUS_DONE):
+                next_frame = job.orig_frame_start + job.frames_rendered_at_stop
+                job.frame_start = min(next_frame, job.orig_frame_end)
+                job.specific_frames = None
+                job.status  = STATUS_WAITING
+                job.progress = int(job.frames_rendered_at_stop / job.orig_total_frames * 100)
+        self._store.save(); self._on_done(); self.destroy()
+
 # ---------------------------------------------------------------------------
-# Set Frame dialog  (quick presets + comma list; separate from Edit for speed)
+# Set Frame dialog
 # ---------------------------------------------------------------------------
 
 class SetFrameDialog(tk.Toplevel):
@@ -955,7 +1006,6 @@ class SettingsDialog(tk.Toplevel):
                  bg=T["bg"], fg=T["fg3"], font=("Segoe UI", 7)
                  ).grid(row=4, column=1, sticky="w", padx=16)
 
-        # ---- Update section ------------------------------------------------
         tk.Frame(self, bg=T["sep"], height=1).grid(
             row=5, column=0, columnspan=2, sticky="ew", padx=16, pady=8)
 
@@ -1002,7 +1052,7 @@ class SettingsDialog(tk.Toplevel):
         self._store.theme = new_theme
         self._store.save()
         apply_theme(new_theme)
-        self._on_done()   # redraws jobs tree with new tag colours
+        self._on_done()
         self.destroy()
         if new_theme != old_theme:
             if messagebox.askyesno("Theme Changed",
@@ -1011,10 +1061,9 @@ class SettingsDialog(tk.Toplevel):
                 os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _check_now(self):
-        Updater(self._store).check_and_prompt(self, silent=False)
+        Updater(self.master, self._store).check_and_prompt(self, silent=False)
 
     def _update_app(self):
-        """Replace main.py with a new version and restart."""
         path = filedialog.askopenfilename(
             title="Select new main.py",
             filetypes=[("Python file","*.py"),("All","*.*")])
@@ -1032,11 +1081,12 @@ class SettingsDialog(tk.Toplevel):
             os.execv(python, [python] + sys.argv)
 
 # ---------------------------------------------------------------------------
-# Updater  (placed after DataStore so the type hint resolves)
+# Updater
 # ---------------------------------------------------------------------------
 
 class Updater:
-    def __init__(self, store: DataStore):
+    def __init__(self, root_widget, store: DataStore):
+        self._root  = root_widget
         self._store = store
 
     def check_and_prompt(self, parent_widget, silent=False):
@@ -1048,7 +1098,6 @@ class Updater:
     def _fetch_manifest(self):
         import urllib.request, time
         try:
-            # Cache-bust so GitHub CDN never serves a stale version.json
             url = f"{UPDATE_MANIFEST_URL}?t={int(time.time())}"
             with urllib.request.urlopen(url, timeout=8) as r:
                 data = json.loads(r.read().decode())
@@ -1206,9 +1255,8 @@ class App(tk.Tk):
         self._tick()
         self._refresh()
 
-        # Auto-update check — runs 3 seconds after launch to not block startup
         if self.store.auto_update:
-            self.after(3000, lambda: Updater(self.store).check_and_prompt(self, silent=True))
+            self.after(3000, lambda: Updater(self, self.store).check_and_prompt(self, silent=True))
 
     # ---------------------------------------------------------------- UI
 
@@ -1342,7 +1390,7 @@ class App(tk.Tk):
         log_vsb.pack(fill="y", side="right")
         logger.add_listener(self._append_log)
 
-        # Context menu with shortcuts shown
+        # Context menu
         self._ctx = tk.Menu(self, tearoff=0, bg=T["bg2"], fg=T["fg"],
                             activebackground=T["bg3"])
         for lbl, cmd, accel in [
@@ -1356,6 +1404,7 @@ class App(tk.Tk):
             ("---", None, ""),
             ("Disable / Enable",         self._ctx_toggle_disable,    "M"),
             ("Re-render (reset)",        self._ctx_rerender,          "Ctrl+R"),
+            ("Resume from Last Frame",   self._ctx_resume_from_last,  ""),   # FIX #7
             ("---", None, ""),
             ("Open Blend",               self._ctx_open_blend,        ""),
             ("Browse Blend Path",        self._ctx_browse_blend,      ""),
@@ -1384,7 +1433,6 @@ class App(tk.Tk):
         self._tree.bind("<Control-A>",        lambda e: self._kb_select_all())
         self._tree.bind("<Control-e>",        lambda e: self._ctx_edit())
         self._tree.bind("<Control-E>",        lambda e: self._ctx_edit())
-
         self._tree.bind("<Delete>",           lambda e: self._ctx_remove())
         self._tree.bind("<Control-space>",    lambda e: self._kb_view_render())
         self._tree.bind("<m>",                lambda e: self._ctx_toggle_disable())
@@ -1411,13 +1459,8 @@ class App(tk.Tk):
         style.map("Treeview", background=[("selected", T["sel"])])
 
     def _on_close(self):
+        # FIX #5: removed duplicate terminate — engine.stop() already handles it
         self.engine.stop()
-        if self.engine._proc is not None:
-            try:
-                self.engine._proc.terminate()
-                self.engine._proc.wait(timeout=5)
-            except Exception:
-                pass
         self.destroy()
 
     def _start_services(self):
@@ -1431,8 +1474,6 @@ class App(tk.Tk):
     def _tick(self):
         if self.engine.running and self.engine.current:
             self._refresh_status()
-            # Only redraw the jobs tree every 5 seconds during active render
-            # to avoid Tk_GetPixmap memory pressure with large queues
             now = time.time()
             if now - self._last_tree_refresh >= 5:
                 self._refresh_jobs()
@@ -1478,10 +1519,8 @@ class App(tk.Tk):
 
         jobs = self.store.jobs_for_queue(self._active_queue)
 
-        # Normalise sequence/shot — legacy jobs may have empty fields
         for job in jobs:
             if not job.sequence or not job.shot:
-                # Try to parse from shot_id e.g. "EPS02_SQ03_SH002"
                 parts = job.shot_id.split("_")
                 sq = next((p for p in parts if p.startswith("SQ")), "")
                 sh = next((p for p in parts if p.startswith("SH")), "")
@@ -1498,7 +1537,6 @@ class App(tk.Tk):
                     else "")
             frames_display = ("~" + job.frames_str if job.range_is_modified else job.frames_str)
             out     = ("…" + job.output_path[-44:] if len(job.output_path) > 47 else job.output_path)
-            # Show "done / total" — cumulative across stop/resume cycles
             if job.status == STATUS_DONE:
                 total_f = f"{job.orig_total_frames} / {job.orig_total_frames}"
             else:
@@ -1516,7 +1554,6 @@ class App(tk.Tk):
             if job.id in sel:
                 self._tree.selection_add(iid)
 
-        # Single job — skip all group rows entirely
         if len(jobs) == 1:
             insert_job("", jobs[0])
         else:
@@ -1528,10 +1565,8 @@ class App(tk.Tk):
                 sh_map  = sq_groups[sq]
                 sq_jobs = [j for sh in sh_map.values() for j in sh]
 
-                # Single job under this SQ — skip both SQ and SH rows
                 if len(sq_jobs) == 1:
-                    insert_job("", sq_jobs[0])
-                    continue
+                    insert_job("", sq_jobs[0]); continue
 
                 sq_done          = sum(1 for j in sq_jobs if j.status == STATUS_DONE)
                 sq_fail          = sum(1 for j in sq_jobs if j.status == STATUS_FAILED)
@@ -1551,10 +1586,8 @@ class App(tk.Tk):
                 for sh in sorted(sh_map):
                     sh_jobs = sh_map[sh]
 
-                    # Single job under this SH — skip SH row, insert directly under SQ
                     if len(sh_jobs) == 1:
-                        insert_job(sq_iid, sh_jobs[0])
-                        continue
+                        insert_job(sq_iid, sh_jobs[0]); continue
 
                     sh_done         = sum(1 for j in sh_jobs if j.status == STATUS_DONE)
                     sh_fail         = sum(1 for j in sh_jobs if j.status == STATUS_FAILED)
@@ -1798,6 +1831,17 @@ class App(tk.Tk):
     def _ctx_rerender(self):
         for j in self._selected_jobs():
             j.status = STATUS_WAITING; j.progress = 0; j.retry_count = 0
+        self.store.save(); self._refresh()
+
+    def _ctx_resume_from_last(self):
+        """FIX #7: context menu action — jump to first unrendered frame."""
+        for j in self._selected_jobs():
+            if j.frames_rendered_at_stop > 0 and j.status not in (STATUS_RENDERING, STATUS_DONE):
+                next_frame = j.orig_frame_start + j.frames_rendered_at_stop
+                j.frame_start = min(next_frame, j.orig_frame_end)
+                j.specific_frames = None
+                j.status   = STATUS_WAITING
+                j.progress = int(j.frames_rendered_at_stop / j.orig_total_frames * 100)
         self.store.save(); self._refresh()
 
     def _ctx_open_blend(self):
