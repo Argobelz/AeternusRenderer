@@ -1,15 +1,16 @@
 """
 build.py — Packages Aeternus Renderer for release.
 
-Two modes:
-  python build.py          # package app/ + addon/ into a zip ready for GitHub Release
-  python build.py --exe    # additionally compile a standalone .exe with PyInstaller
+Running this script does three things:
+  1. Compiles dist/AeternusRenderer.exe  (pin to taskbar, double-click to run)
+  2. Packages dist/AeternusRenderer.zip  (uploaded to GitHub Release for auto-updater)
+  3. Updates version.json with the correct release URL
 
-Release workflow (after running this script):
-  gh release create v{VERSION} dist/AeternusRenderer.zip --title "v{VERSION}" --notes "Release notes here"
+Release workflow after running:
+  gh release create v{VERSION} dist/AeternusRenderer.zip --title "v{VERSION}" --notes "..."
 
-That makes the zip available at the URL stored in version.json, which the
-in-app updater fetches automatically on next launch.
+The exe is for you to run locally. The zip is what the in-app updater downloads.
+Pin the exe to your taskbar — it will update itself in place on next launch.
 """
 
 import subprocess
@@ -26,7 +27,7 @@ ICON        = "app/icon.ico"
 DIST_DIR    = "dist"
 BUILD_DIR   = "build"
 
-# Files and folders to include in the release zip
+# Files included in the updater zip (not the exe — exe is compiled separately)
 ZIP_INCLUDES = [
     "app/main.py",
     "addon/aeternus_send_job.py",
@@ -54,25 +55,22 @@ def clean():
     print("[build] Cleaned previous build artifacts.")
 
 
-def build_zip(version):
-    """Package source files into a release zip."""
-    os.makedirs(DIST_DIR, exist_ok=True)
-    zip_path = os.path.join(DIST_DIR, f"{APP_NAME}.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in ZIP_INCLUDES:
-            if os.path.exists(path):
-                # Preserve the relative path inside the zip so the updater
-                # can find app/main.py at the expected location.
-                zf.write(path, path)
-                print(f"  + {path}")
-            else:
-                print(f"  ! MISSING: {path} — skipped")
-    print(f"\n[build] Zip created: {zip_path}")
-    return zip_path
+def update_version_json(version):
+    vpath = "version.json"
+    with open(vpath) as f:
+        data = json.load(f)
+    data["version"] = version
+    data["zip_url"] = (
+        f"https://github.com/Argobelz/AeternusRenderer/releases/download/"
+        f"v{version}/{APP_NAME}.zip"
+    )
+    with open(vpath, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"[build] version.json updated → v{version}")
 
 
 def build_exe(version):
-    """Compile a standalone .exe with PyInstaller (optional)."""
+    """Compile standalone exe with PyInstaller."""
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
@@ -91,44 +89,49 @@ def build_exe(version):
         print("\n[build] PyInstaller FAILED — see errors above.")
         sys.exit(1)
     exe = os.path.join(DIST_DIR, f"{APP_NAME}.exe")
-    print(f"[build] Exe built: {exe}")
+    print(f"[build] Exe ready: {exe}")
+    return exe
 
 
-def update_version_json(version):
-    """Sync version.json zip_url to match the new version tag."""
-    vpath = "version.json"
-    with open(vpath) as f:
-        data = json.load(f)
-    data["version"] = version
-    data["zip_url"] = (
-        f"https://github.com/Argobelz/AeternusRenderer/releases/download/"
-        f"v{version}/{APP_NAME}.zip"
-    )
-    with open(vpath, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"[build] version.json updated → v{version}")
+def build_zip(version):
+    """Package source files into the updater zip."""
+    zip_path = os.path.join(DIST_DIR, f"{APP_NAME}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in ZIP_INCLUDES:
+            if os.path.exists(path):
+                zf.write(path, path)
+                print(f"  + {path}")
+            else:
+                print(f"  ! MISSING: {path} — skipped")
+    print(f"[build] Zip ready:  {zip_path}")
+    return zip_path
 
 
 def main():
-    build_exe_flag = "--exe" in sys.argv
     version = get_version()
     clean()
     update_version_json(version)
+
+    # Always build exe first so you have something to pin/run
+    exe_path = build_exe(version)
+
+    # Then package the updater zip
     zip_path = build_zip(version)
-    if build_exe_flag:
-        build_exe(version)
 
     print(f"""
 [release] v{version} ready.
 
-Next steps:
-  1. Commit:   git add app/main.py version.json
-               git commit -m "Release v{version}"
-               git push
+  {exe_path}   ← pin this to your taskbar
+  {zip_path}    ← upload this to GitHub Release
 
-  2. Publish:  gh release create v{version} {zip_path} --title "v{version}" --notes "..."
+Steps:
+  1. git add app/main.py version.json
+     git commit -m "Release v{version}"
+     git push
 
-  All installed copies will auto-update on next launch.
+  2. gh release create v{version} dist/{APP_NAME}.zip --title "v{version}" --notes "..."
+
+All installed copies auto-update on next launch.
 """)
 
 
