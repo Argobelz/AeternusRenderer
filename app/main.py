@@ -42,7 +42,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 APP_TITLE     = "Aeternus Renderer"
-APP_VERSION   = "0.7"
+APP_VERSION   = "0.8"
 ADDON_VERSION = "2.5"          # FIX #1: unified with addon — was mismatched (app 2.3, addon 2.4)
 APP_PORT      = 47821
 CONFIG_DIR    = os.path.join(os.path.expanduser("~"), ".aeternus_renderer")
@@ -52,9 +52,15 @@ DEFAULT_BLENDER = r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
 DEFAULT_PLAYER  = r"C:\Program Files\DJV2\bin\djv.exe"
 AUTO_RETRY_MAX  = 3
 
-# Update URLs — raw GitHub content
+# Update URLs — version.json stays on raw for fast manifest lookup;
+# zip_url in the manifest should point to a GitHub Release asset, e.g.:
+#   https://github.com/Argobelz/AeternusRenderer/releases/download/v0.8/AeternusRenderer.zip
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Argobelz/AeternusRenderer/main/version.json"
-UPDATE_EXE_URL      = "https://raw.githubusercontent.com/Argobelz/AeternusRenderer/main/AeternusRenderer.exe"
+UPDATE_EXE_URL      = "https://github.com/Argobelz/AeternusRenderer/releases/latest/download/AeternusRenderer.zip"
+
+# Render hang timeout — if no Fra: output for this many seconds, kill and fail the job.
+# Set to 0 to disable.
+HANG_TIMEOUT_SECS = 300  # 5 minutes
 
 STATUS_WAITING   = "Waiting"
 STATUS_RENDERING = "Rendering"
@@ -232,6 +238,7 @@ class DataStore:
         self.auto_retry    = True
         self.theme         = "Dark"
         self.auto_update   = True
+        self.hang_timeout  = HANG_TIMEOUT_SECS
         self.load()
 
     def load(self):
@@ -246,6 +253,7 @@ class DataStore:
             self.auto_retry    = raw.get("auto_retry",    True)
             self.theme         = raw.get("theme",         "Dark")
             self.auto_update   = raw.get("auto_update",   True)
+            self.hang_timeout  = raw.get("hang_timeout",  HANG_TIMEOUT_SECS)
             self.jobs = [Job(j) for j in raw.get("jobs", [])]
             for j in self.jobs:
                 if j.status == STATUS_RENDERING:
@@ -263,6 +271,7 @@ class DataStore:
                     "auto_retry"   : self.auto_retry,
                     "theme"        : self.theme,
                     "auto_update"  : self.auto_update,
+                    "hang_timeout" : self.hang_timeout,
                     "jobs"         : [j.to_dict() for j in self.jobs],
                 }, f, indent=2)
         except Exception as e:
@@ -610,6 +619,7 @@ class RenderEngine:
 
         self._last_frame_time = None
         self._frame_durations  = []
+        _hang_timed_out = False
 
         try:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -618,9 +628,12 @@ class RenderEngine:
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=flags)
             _active_blender_procs.append(self._proc)
+            last_output_time = time.time()
             for line in self._proc.stdout:
                 line = line.strip()
-                if line: logger.log(line)
+                if line:
+                    logger.log(line)
+                    last_output_time = time.time()
                 m = re.search(r"Fra:(\d+)", line)
                 if m:
                     frame = int(m.group(1))
@@ -645,8 +658,22 @@ class RenderEngine:
 
                         job.progress = int(min(done / total * 100, 99))
                         self.on_update()
+
+                # Hang timeout check — kill if no output for too long
+                timeout = self.store.hang_timeout
+                if timeout and timeout > 0:
+                    if time.time() - last_output_time > timeout:
+                        logger.log(f"HANG TIMEOUT: {job.label} — no output for {timeout}s. Killing.")
+                        _hang_timed_out = True
+                        try:
+                            self._proc.terminate()
+                            try: self._proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired: self._proc.kill()
+                        except Exception: pass
+                        break
+
             self._proc.wait()
-            return self._proc.returncode == 0
+            return (not _hang_timed_out) and self._proc.returncode == 0
         except Exception as e:
             logger.log(f"Render error: {e}"); return False
         finally:
@@ -982,6 +1009,7 @@ class SettingsDialog(tk.Toplevel):
         self._blender = tk.StringVar(value=store.blender_path)
         self._player  = tk.StringVar(value=store.player_path)
         self._theme   = tk.StringVar(value=store.theme)
+        self._hang_timeout = tk.StringVar(value=str(store.hang_timeout))
 
         lbl("Blender Executable:", 0)
         path_row(self._blender, 0, "Select Blender", [("blender.exe","blender.exe"),("All","*.*")])
@@ -992,9 +1020,17 @@ class SettingsDialog(tk.Toplevel):
                  bg=T["bg"], fg=T["fg3"], font=("Segoe UI", 7)
                  ).grid(row=2, column=1, sticky="w", padx=16)
 
-        lbl("Theme:", 3)
+        lbl("Hang Timeout (s):", 3)
+        ht_frame = tk.Frame(self, bg=T["bg"])
+        ht_frame.grid(row=3, column=1, **pad)
+        tk.Entry(ht_frame, textvariable=self._hang_timeout, bg=T["bg2"], fg=T["fg"],
+                 insertbackground=T["fg"], font=("Segoe UI", 9), width=8).pack(side="left")
+        tk.Label(ht_frame, text="  Kill job if no output for this many seconds. Set 0 to disable.",
+                 bg=T["bg"], fg=T["fg3"], font=("Segoe UI", 8)).pack(side="left")
+
+        lbl("Theme:", 4)
         theme_frame = tk.Frame(self, bg=T["bg"])
-        theme_frame.grid(row=3, column=1, **pad)
+        theme_frame.grid(row=4, column=1, **pad)
         for name in THEMES:
             tk.Radiobutton(theme_frame, text=name, variable=self._theme, value=name,
                            bg=T["bg"], fg=T["fg"], selectcolor=T["bg2"],
@@ -1004,14 +1040,14 @@ class SettingsDialog(tk.Toplevel):
 
         tk.Label(self, text="You will be prompted to restart to fully apply.",
                  bg=T["bg"], fg=T["fg3"], font=("Segoe UI", 7)
-                 ).grid(row=4, column=1, sticky="w", padx=16)
+                 ).grid(row=5, column=1, sticky="w", padx=16)
 
         tk.Frame(self, bg=T["sep"], height=1).grid(
-            row=5, column=0, columnspan=2, sticky="ew", padx=16, pady=8)
+            row=6, column=0, columnspan=2, sticky="ew", padx=16, pady=8)
 
-        lbl("Updates:", 6)
+        lbl("Updates:", 7)
         upd_frame = tk.Frame(self, bg=T["bg"])
-        upd_frame.grid(row=6, column=1, **pad)
+        upd_frame.grid(row=7, column=1, **pad)
 
         self._auto_update = tk.BooleanVar(value=store.auto_update)
         tk.Checkbutton(upd_frame, text="Check automatically on launch",
@@ -1028,10 +1064,10 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(self,
                  text=f"Current version: {APP_VERSION}  •  Updates from github.com/Argobelz/AeternusRenderer",
                  bg=T["bg"], fg=T["fg3"], font=("Segoe UI", 7)
-                 ).grid(row=7, column=1, sticky="w", padx=16)
+                 ).grid(row=8, column=1, sticky="w", padx=16)
 
         btn_frame = tk.Frame(self, bg=T["bg"])
-        btn_frame.grid(row=8, column=0, columnspan=2, pady=12)
+        btn_frame.grid(row=9, column=0, columnspan=2, pady=12)
         tk.Button(btn_frame, text="Save", bg="#2a4a6e", fg="#ddd",
                   font=("Segoe UI", 9), relief="flat", padx=20,
                   command=self._save).pack(side="left", padx=8)
@@ -1047,6 +1083,10 @@ class SettingsDialog(tk.Toplevel):
         self._store.blender_path = self._blender.get()
         self._store.player_path  = self._player.get()
         self._store.auto_update  = self._auto_update.get()
+        try:
+            self._store.hang_timeout = max(0, int(self._hang_timeout.get()))
+        except ValueError:
+            pass  # keep existing value if input is invalid
         old_theme = self._store.theme
         new_theme = self._theme.get()
         self._store.theme = new_theme
@@ -1682,6 +1722,8 @@ class App(tk.Tk):
         SettingsDialog(self, self.store, self._refresh)
 
     def _on_all_done(self):
+        # Notify — play system sound and show a Windows toast if possible
+        self.after(0, self._notify_done)
         if self.store.auto_shutdown:
             logger.log("Auto-shutdown in 60s.")
             self.after(0, lambda: messagebox.showinfo(
@@ -1691,6 +1733,33 @@ class App(tk.Tk):
                 daemon=True).start()
         else:
             self.after(0, self._schedule_refresh)
+
+    def _notify_done(self):
+        """Play a system sound and attempt a Windows toast notification."""
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            pass
+        try:
+            # PowerShell toast — works on Windows 10+ without extra packages.
+            # Silently skipped if PowerShell or the cmdlet isn't available.
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$n = New-Object System.Windows.Forms.NotifyIcon; "
+                "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+                "$n.Visible = $true; "
+                "$n.ShowBalloonTip(6000, 'Aeternus Renderer', 'All jobs complete.', "
+                "[System.Windows.Forms.ToolTipIcon]::Info); "
+                "Start-Sleep -Seconds 7; $n.Dispose()"
+            )
+            subprocess.Popen(
+                ["powershell", "-WindowStyle", "Hidden", "-Command", ps],
+                creationflags=subprocess.CREATE_NO_WINDOW
+                              if sys.platform == "win32" else 0
+            )
+        except Exception:
+            pass
 
     def _on_select(self, event):
         sel = self._tree.selection()
