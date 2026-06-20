@@ -1,5 +1,5 @@
 """
-Aeternus Renderer v0.7
+Aeternus Renderer v0.9
 Standalone Windows render manager for Blender.
 """
 
@@ -42,7 +42,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 APP_TITLE     = "Aeternus Renderer"
-APP_VERSION   = "0.8"
+APP_VERSION   = "0.9"
 ADDON_VERSION = "2.5"          # FIX #1: unified with addon — was mismatched (app 2.3, addon 2.4)
 APP_PORT      = 47821
 CONFIG_DIR    = os.path.join(os.path.expanduser("~"), ".aeternus_renderer")
@@ -54,7 +54,7 @@ AUTO_RETRY_MAX  = 3
 
 # Update URLs — version.json stays on raw for fast manifest lookup;
 # zip_url in the manifest should point to a GitHub Release asset, e.g.:
-#   https://github.com/Argobelz/AeternusRenderer/releases/download/v0.8/AeternusRenderer.zip
+#   https://github.com/Argobelz/AeternusRenderer/releases/download/v0.9/AeternusRenderer.zip
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Argobelz/AeternusRenderer/main/version.json"
 UPDATE_EXE_URL      = "https://github.com/Argobelz/AeternusRenderer/releases/latest/download/AeternusRenderer.zip"
 
@@ -1946,4 +1946,5 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
+
 
