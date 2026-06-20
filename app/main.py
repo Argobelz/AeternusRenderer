@@ -657,6 +657,7 @@ class RenderEngine:
                             job.frame_start = max(job.frame_start, frame + 1)
 
                         job.progress = int(min(done / total * 100, 99))
+                        job.frames_rendered = done
                         self.on_update()
 
                 # Hang timeout check — kill if no output for too long
@@ -1945,3 +1946,4 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
+
